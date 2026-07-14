@@ -31,13 +31,16 @@ int field_offset(const sensor_msgs::msg::PointCloud2 & m, const char * name, int
 
 int main(int argc, char ** argv) {
   const bool explicit_bag = argc > 1;
-  const std::string bag = explicit_bag ? argv[1]
-    : (std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG")
-      ? std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG")
-      : "/home/frank/data/fast_livo/CBD_Building_01_frontend_raw_offset_time_full");
+  const char * env_bag = std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG");
+  const std::string bag = explicit_bag ? argv[1] : (env_bag ? env_bag : "");
+  if (bag.empty()) {
+    std::printf(
+      "[ingest_offset_time] SKIP: set COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG or pass a bag path\n");
+    return 77;
+  }
   if (!std::filesystem::exists(bag)) {
     std::printf("[ingest_offset_time] SKIP: bag path is unavailable: %s\n", bag.c_str());
-    return explicit_bag ? 1 : 0;
+    return explicit_bag ? 1 : 77;
   }
   const int n_scan = 6;  // Livox Avia scan lines (upstream n_scan)
 

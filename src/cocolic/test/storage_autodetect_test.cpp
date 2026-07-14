@@ -46,17 +46,21 @@ static int probe(const std::string & uri) {
 int main() {
   int rc = 0;
   std::printf("[storage_autodetect_test] empty storage_id auto-detect:\n");
-  const std::string sqlite_bag = std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG")
-    ? std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG")
-    : "/home/frank/data/fast_livo/CBD_Building_01_frontend_raw";
-  const std::string mcap_bag = std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG")
-    ? std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG")
-    : "/home/frank/data/fast_livo/CBD_Building_01_frontend_raw_offset_time_full";
+  const char * sqlite_env = std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG");
+  const char * mcap_env = std::getenv("COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG");
+  const std::string sqlite_bag = sqlite_env ? sqlite_env : "";
+  const std::string mcap_bag = mcap_env ? mcap_env : "";
+  if (sqlite_bag.empty() || mcap_bag.empty()) {
+    std::printf(
+      "[storage_autodetect_test] SKIP: set COCOLIC_TEST_FASTLIVO2_RAW_BAG and "
+      "COCOLIC_TEST_FASTLIVO2_OFFSET_TIME_BAG\n");
+    return 77;
+  }
   if (!std::filesystem::exists(sqlite_bag) || !std::filesystem::exists(mcap_bag)) {
     std::printf(
       "[storage_autodetect_test] SKIP: bag paths unavailable: sqlite=%s mcap=%s\n",
       sqlite_bag.c_str(), mcap_bag.c_str());
-    return 0;
+    return 77;
   }
   rc |= probe(sqlite_bag);  // sqlite3 dir
   rc |= probe(mcap_bag);    // mcap dir

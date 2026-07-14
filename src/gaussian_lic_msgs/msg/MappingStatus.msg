@@ -35,6 +35,14 @@ uint64 skipped_max_depth_points
 uint64 skipped_unprojected_points
 uint64 skipped_occluded_points
 
+# SPNet/depth-completion diagnostics. Completion is evaluated only for
+# keyframes; the original sparse depth remains the optimization target.
+uint64 depth_completion_inference_count
+uint64 depth_completion_accepted_count
+uint64 depth_completion_appended_points
+uint64 depth_completion_rejected_bias_count
+uint64 depth_completion_rejected_max_depth_points
+
 # Torch/CUDA Gaussian backend diagnostics. These make native tracking reports
 # prove whether the mapper only initialized a fixed map or kept extending,
 # optimizing, densifying, pruning, and resetting opacity during replay.

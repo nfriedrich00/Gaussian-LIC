@@ -38,16 +38,16 @@ NGC image only if `scripts/sm120_compat_probe.sh` fails.
 
 ## Build Profiles
 
-Default ROS2 build keeps CUDA optional:
+Middleware/CI build without the production CUDA backend:
 
 ```bash
-./scripts/build_ros2.sh
+./scripts/build_ros2.sh --cpu-only
 ```
 
-Strict CUDA/Torch plumbing build:
+Production CUDA/Torch build:
 
 ```bash
-./scripts/build_cuda_strict.sh --packages-select gaussian_lic_mapping
+./scripts/build_ros2.sh --full
 ```
 
 The strict wrapper clears the package CMake cache by default because switching

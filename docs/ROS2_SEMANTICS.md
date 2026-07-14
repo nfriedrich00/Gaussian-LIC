@@ -72,7 +72,7 @@ paper-level CUDA mapper and continuous-time frontend are being ported.
 
 ## Executor
 
-- Strict replay and composition use the single-threaded `component_container`.
+- Composition uses `component_container_mt`; mapping keeps sensor mutation serialized while GPU optimization runs in a separate callback group so DDS input is not starved by long optimizer steps.
 - `gaussian_lic_tracking/tracking_node` defaults `serialize_callbacks:=true`.
   All raw image, camera-info, depth, LiDAR, IMU, rendered-image, and Gaussian-map
   callbacks pass through one mutex before mutating estimator state, so a launch
@@ -90,12 +90,37 @@ paper-level CUDA mapper and continuous-time frontend are being ported.
   may consume static extrinsics from configuration, but any time-varying transform
   used for math needs an explicit stamped buffer and an upstream-parity test.
 
+## Point-cloud coordinate contract
+
+- `run_bag.launch.py` exposes `pointcloud_coordinates:=auto|world|sensor` and
+  passes the resolved value to the mapper. `auto` resolves to `world` when the
+  contract adapter is disabled, to `sensor` for normal adapter output, and back
+  to `world` when IMU pose fallback rotates adapter clouds into the world frame.
+  An explicit `world` or `sensor` always wins.
+- The LIC2 adapter validates the complete `PointCloud2` layout before publishing:
+  point/row steps, exact padded data length, unique scalar FLOAT32/FLOAT64 xyz
+  fields, field bounds, organized row padding, and message endianness. A cloud
+  is dropped if validation, a static transform, or the IMU-frame transform
+  fails; untransformed sensor data is never relabeled and forwarded as world data.
+
 ## Rosbag Replay
 
 - Launch replay uses `ros2 bag play ... --clock --read-ahead-queue-size 100`
   and `use_sim_time:=true`. The queue stays bounded for deterministic pressure
   while still large enough for Jazzy rosbag2 to deliver mixed high-rate sensor
   topics.
+- Playback is started by a two-second launch timer after mapper/adapter actions
+  are created, preventing the first finite-bag samples from racing subscription
+  discovery.
+- `run_bag.launch.py` derives the default `use_sim_time` value from `play_bag`:
+  live/no-bag launches use the wall clock instead of freezing while waiting for
+  a nonexistent `/clock` publisher.
+- The launch defaults to the native mapper (`stub_mode:=false`); diagnostic
+  topic/status stubs are enabled only by an explicit `stub_mode:=true`.
+- Mapper launch arguments default to a profile-inheritance sentinel. Values in
+  the selected `mapping_node.ros__parameters` (including optional depth,
+  optimization steps, and final render evaluation) are preserved, while an
+  explicit `name:=value` launch override has higher priority.
 - Strict current collection replays finite datasets without `--loop` by default,
   waits for playback completion, then keeps the mapper alive for a configurable
   settle window before saving outputs. `--loop-playback` is reserved for smoke

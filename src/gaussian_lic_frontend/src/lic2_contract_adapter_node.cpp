@@ -20,6 +20,7 @@
 #include "builtin_interfaces/msg/time.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "gaussian_lic_frontend/pointcloud_contract.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -121,61 +122,6 @@ std::array<double, 9> rotation_matrix(const UnitQuaternion & q)
     2.0 * (q.x * q.z - q.y * q.w),
     2.0 * (q.y * q.z + q.x * q.w),
     1.0 - 2.0 * (q.x * q.x + q.y * q.y)};
-}
-
-const sensor_msgs::msg::PointField * find_field(
-  const sensor_msgs::msg::PointCloud2 & cloud,
-  const char * name)
-{
-  const auto it = std::find_if(
-    cloud.fields.begin(), cloud.fields.end(),
-    [name](const sensor_msgs::msg::PointField & field) {
-      return field.name == name;
-    });
-  return it == cloud.fields.end() ? nullptr : &(*it);
-}
-
-template<typename T>
-T read_value(const uint8_t * ptr)
-{
-  T value{};
-  std::memcpy(&value, ptr, sizeof(T));
-  return value;
-}
-
-template<typename T>
-void write_value(uint8_t * ptr, const T value)
-{
-  std::memcpy(ptr, &value, sizeof(T));
-}
-
-double read_float_field(const uint8_t * base, const sensor_msgs::msg::PointField & field)
-{
-  const uint8_t * ptr = base + field.offset;
-  if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
-    return static_cast<double>(read_value<float>(ptr));
-  }
-  if (field.datatype == sensor_msgs::msg::PointField::FLOAT64) {
-    return read_value<double>(ptr);
-  }
-  throw std::runtime_error("pointcloud transform requires FLOAT32 or FLOAT64 x/y/z fields");
-}
-
-void write_float_field(
-  uint8_t * base,
-  const sensor_msgs::msg::PointField & field,
-  const double value)
-{
-  uint8_t * ptr = base + field.offset;
-  if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
-    write_value<float>(ptr, static_cast<float>(value));
-    return;
-  }
-  if (field.datatype == sensor_msgs::msg::PointField::FLOAT64) {
-    write_value<double>(ptr, value);
-    return;
-  }
-  throw std::runtime_error("pointcloud transform requires FLOAT32 or FLOAT64 x/y/z fields");
 }
 
 }  // namespace
@@ -678,18 +624,23 @@ private:
         ++pointcloud_transform_error_count_;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "failed to transform/filter pointcloud%s: %s",
-          pointcloud_filter_enabled() ? "; dropping cloud because filtering is required" :
-          "; forwarding original cloud",
+          "failed to validate/transform/filter pointcloud; dropping cloud: %s",
           ex.what());
-        if (pointcloud_filter_enabled()) {
-          ++dropped_pointcloud_count_;
-          return;
-        }
-        cloud = *msg;
+        ++dropped_pointcloud_count_;
+        return;
       }
     } else {
-      cloud = *msg;
+      try {
+        (void)gaussian_lic_frontend::validate_pointcloud_xyz_layout(*msg);
+        cloud = *msg;
+      } catch (const std::exception & ex) {
+        ++pointcloud_transform_error_count_;
+        ++dropped_pointcloud_count_;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "failed to validate pointcloud; dropping cloud: %s", ex.what());
+        return;
+      }
     }
     if (!cloud) {
       ++dropped_pointcloud_count_;
@@ -808,74 +759,94 @@ private:
   {
     sensor_msgs::msg::PointCloud2 out = cloud;
     const bool rotate_with_imu = imu_pose_fallback_ && rotate_pointcloud_with_imu_pose_;
-    const UnitQuaternion imu_orientation = pointcloud_use_stamp_imu_orientation_ ?
-      imu_orientation_at_or_before(cloud.header.stamp) :
-      current_imu_orientation();
+    UnitQuaternion imu_orientation;
+    if (rotate_with_imu) {
+      const auto available_orientation = pointcloud_use_stamp_imu_orientation_ ?
+        imu_orientation_at_or_before(cloud.header.stamp) :
+        current_imu_orientation();
+      if (!available_orientation) {
+        throw std::runtime_error(
+                "IMU world-frame pointcloud transform requested but no orientation is available");
+      }
+      imu_orientation = *available_orientation;
+    }
     const auto imu_rotation = rotation_matrix(imu_orientation);
     if (rotate_with_imu) {
       out.header.frame_id = world_frame_;
-    } else if (!pointcloud_transform_target_frame_.empty()) {
+    } else if (
+      transform_pointcloud_to_camera_frame_ && !pointcloud_transform_target_frame_.empty())
+    {
       out.header.frame_id = pointcloud_transform_target_frame_;
     }
 
-    const auto * x_field = find_field(out, "x");
-    const auto * y_field = find_field(out, "y");
-    const auto * z_field = find_field(out, "z");
-    if (!x_field || !y_field || !z_field) {
-      throw std::runtime_error("PointCloud2 must contain x/y/z fields");
-    }
-
-    const size_t point_count = static_cast<size_t>(out.width) * static_cast<size_t>(out.height);
+    const auto layout = gaussian_lic_frontend::validate_pointcloud_xyz_layout(out);
+    const size_t point_count = layout.point_count;
     const bool filter_points = pointcloud_filter_enabled();
     std::vector<uint8_t> filtered;
     if (filter_points) {
-      filtered.resize(point_count * static_cast<size_t>(out.point_step));
+      const size_t filtered_capacity = gaussian_lic_frontend::checked_multiply(
+        point_count, static_cast<size_t>(out.point_step), "filtered data size");
+      if (filtered_capacity > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(
+                "filtered PointCloud2 would exceed the uint32 row_step range");
+      }
+      filtered.resize(filtered_capacity);
     }
     size_t kept_points = 0;
-    for (size_t i = 0; i < point_count; ++i) {
-      const uint8_t * source = cloud.data.data() + i * cloud.point_step;
-      const double x = read_float_field(source, *x_field);
-      const double y = read_float_field(source, *y_field);
-      const double z = read_float_field(source, *z_field);
-      const auto & r = pointcloud_transform_rotation_;
-      const auto & t = pointcloud_transform_translation_;
-      double tx = x;
-      double ty = y;
-      double tz = z;
-      if (transform_pointcloud_to_camera_frame_) {
-        tx = r[0] * x + r[1] * y + r[2] * z + t[0];
-        ty = r[3] * x + r[4] * y + r[5] * z + t[1];
-        tz = r[6] * x + r[7] * y + r[8] * z + t[2];
-      }
-      if (filter_points) {
-        if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) {
-          continue;
+    for (size_t row = 0U; row < out.height; ++row) {
+      for (size_t column = 0U; column < out.width; ++column) {
+        const size_t source_offset = gaussian_lic_frontend::point_offset(
+          cloud, layout, row, column);
+        const uint8_t * source = cloud.data.data() + source_offset;
+        const double x = gaussian_lic_frontend::read_float_field(
+          source, *layout.x, cloud.is_bigendian);
+        const double y = gaussian_lic_frontend::read_float_field(
+          source, *layout.y, cloud.is_bigendian);
+        const double z = gaussian_lic_frontend::read_float_field(
+          source, *layout.z, cloud.is_bigendian);
+        const auto & r = pointcloud_transform_rotation_;
+        const auto & t = pointcloud_transform_translation_;
+        double tx = x;
+        double ty = y;
+        double tz = z;
+        if (transform_pointcloud_to_camera_frame_) {
+          tx = r[0] * x + r[1] * y + r[2] * z + t[0];
+          ty = r[3] * x + r[4] * y + r[5] * z + t[1];
+          tz = r[6] * x + r[7] * y + r[8] * z + t[2];
         }
-        if (tz <= pointcloud_filter_min_z_) {
-          continue;
+        if (filter_points) {
+          if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) {
+            continue;
+          }
+          if (tz <= pointcloud_filter_min_z_) {
+            continue;
+          }
+          if (pointcloud_filter_max_z_ > 0.0 && tz > pointcloud_filter_max_z_) {
+            continue;
+          }
         }
-        if (pointcloud_filter_max_z_ > 0.0 && tz > pointcloud_filter_max_z_) {
-          continue;
+        if (rotate_with_imu) {
+          const double wx = imu_rotation[0] * tx + imu_rotation[1] * ty + imu_rotation[2] * tz;
+          const double wy = imu_rotation[3] * tx + imu_rotation[4] * ty + imu_rotation[5] * tz;
+          const double wz = imu_rotation[6] * tx + imu_rotation[7] * ty + imu_rotation[8] * tz;
+          tx = wx;
+          ty = wy;
+          tz = wz;
         }
+        uint8_t * target = filter_points ?
+          (filtered.data() + kept_points * static_cast<size_t>(out.point_step)) :
+          (out.data.data() + source_offset);
+        if (filter_points) {
+          std::memcpy(target, source, out.point_step);
+        }
+        gaussian_lic_frontend::write_float_field(
+          target, *layout.x, tx, out.is_bigendian);
+        gaussian_lic_frontend::write_float_field(
+          target, *layout.y, ty, out.is_bigendian);
+        gaussian_lic_frontend::write_float_field(
+          target, *layout.z, tz, out.is_bigendian);
+        ++kept_points;
       }
-      if (rotate_with_imu) {
-        const double wx = imu_rotation[0] * tx + imu_rotation[1] * ty + imu_rotation[2] * tz;
-        const double wy = imu_rotation[3] * tx + imu_rotation[4] * ty + imu_rotation[5] * tz;
-        const double wz = imu_rotation[6] * tx + imu_rotation[7] * ty + imu_rotation[8] * tz;
-        tx = wx;
-        ty = wy;
-        tz = wz;
-      }
-      uint8_t * target = filter_points ?
-        (filtered.data() + kept_points * static_cast<size_t>(out.point_step)) :
-        (out.data.data() + i * out.point_step);
-      if (filter_points) {
-        std::memcpy(target, source, out.point_step);
-      }
-      write_float_field(target, *x_field, tx);
-      write_float_field(target, *y_field, ty);
-      write_float_field(target, *z_field, tz);
-      ++kept_points;
     }
     if (filter_points) {
       if (pointcloud_filter_min_points_ > 0 &&
@@ -908,16 +879,22 @@ private:
 
   void publish_imu_pose_fallback(const builtin_interfaces::msg::Time & stamp)
   {
-    const UnitQuaternion imu_orientation = pointcloud_use_stamp_imu_orientation_ ?
+    const auto imu_orientation = pointcloud_use_stamp_imu_orientation_ ?
       imu_orientation_at_or_before(stamp) :
       current_imu_orientation();
+    if (!imu_orientation) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "not publishing IMU pose fallback because no orientation is available at the cloud stamp");
+      return;
+    }
     geometry_msgs::msg::PoseStamped pose;
     pose.header.stamp = stamp;
     pose.header.frame_id = world_frame_;
-    pose.pose.orientation.w = imu_orientation.w;
-    pose.pose.orientation.x = imu_orientation.x;
-    pose.pose.orientation.y = imu_orientation.y;
-    pose.pose.orientation.z = imu_orientation.z;
+    pose.pose.orientation.w = imu_orientation->w;
+    pose.pose.orientation.x = imu_orientation->x;
+    pose.pose.orientation.y = imu_orientation->y;
+    pose.pose.orientation.z = imu_orientation->z;
     publish_frontend_pose(pose, false, false);
     ++imu_pose_fallback_count_;
   }
@@ -963,13 +940,17 @@ private:
     }
   }
 
-  UnitQuaternion current_imu_orientation() const
+  std::optional<UnitQuaternion> current_imu_orientation() const
   {
     std::lock_guard<std::mutex> lock(imu_mutex_);
+    if (imu_orientation_history_.empty()) {
+      return std::nullopt;
+    }
     return imu_orientation_;
   }
 
-  UnitQuaternion imu_orientation_at_or_before(const builtin_interfaces::msg::Time & stamp) const
+  std::optional<UnitQuaternion> imu_orientation_at_or_before(
+    const builtin_interfaces::msg::Time & stamp) const
   {
     const int64_t stamp_nsec = stamp_to_nsec(stamp);
     std::lock_guard<std::mutex> lock(imu_mutex_);
@@ -978,7 +959,7 @@ private:
         return it->second;
       }
     }
-    return UnitQuaternion{};
+    return std::nullopt;
   }
 
   void publish_frontend_pose(

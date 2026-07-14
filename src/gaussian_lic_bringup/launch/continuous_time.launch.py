@@ -14,6 +14,15 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
     raw_imu_topic = LaunchConfiguration("raw_imu_topic")
     raw_pointcloud_topic = LaunchConfiguration("raw_pointcloud_topic")
+    raw_image_topic = LaunchConfiguration("raw_image_topic")
+    raw_camera_info_topic = LaunchConfiguration("raw_camera_info_topic")
+    deterministic_bag_path = LaunchConfiguration("deterministic_bag_path")
+    deterministic_feedback_bag_path = LaunchConfiguration("deterministic_feedback_bag_path")
+    replay_imu_topic = LaunchConfiguration("replay_imu_topic")
+    replay_lidar_topic = LaunchConfiguration("replay_lidar_topic")
+    replay_image_topic = LaunchConfiguration("replay_image_topic")
+    replay_camera_info_topic = LaunchConfiguration("replay_camera_info_topic")
+    output_tum_path = LaunchConfiguration("output_tum_path")
     external_odometry_prior_topic = LaunchConfiguration("external_odometry_prior_topic")
     enable_external_odometry_prior = LaunchConfiguration("enable_external_odometry_prior")
     enable_external_odometry_position_factors = LaunchConfiguration(
@@ -56,6 +65,12 @@ def generate_launch_description() -> LaunchDescription:
     )
     lidar_huber_delta_m = LaunchConfiguration("lidar_huber_delta_m")
     step_period_seconds = LaunchConfiguration("step_period_seconds")
+    use_stamp_driven_steps = LaunchConfiguration("use_stamp_driven_steps")
+    max_stamp_driven_steps_per_callback = LaunchConfiguration(
+        "max_stamp_driven_steps_per_callback"
+    )
+    pose_output_period_seconds = LaunchConfiguration("pose_output_period_seconds")
+    max_path_history = LaunchConfiguration("max_path_history")
     output_max_pose_step_m = LaunchConfiguration("output_max_pose_step_m")
     output_max_velocity_mps = LaunchConfiguration("output_max_velocity_mps")
     output_max_position_abs_m = LaunchConfiguration("output_max_position_abs_m")
@@ -74,6 +89,7 @@ def generate_launch_description() -> LaunchDescription:
         "apply_position_update_on_rotation_reject"
     )
     apply_limited_rotation_update = LaunchConfiguration("apply_limited_rotation_update")
+    apply_limited_position_update = LaunchConfiguration("apply_limited_position_update")
     scale_position_with_limited_rotation = LaunchConfiguration(
         "scale_position_with_limited_rotation"
     )
@@ -108,12 +124,25 @@ def generate_launch_description() -> LaunchDescription:
     )
     body_frame_id = LaunchConfiguration("body_frame_id")
     world_frame_id = LaunchConfiguration("world_frame_id")
+    gaussian_map_topic = LaunchConfiguration("gaussian_map_topic")
+    gaussian_snapshot_qos_depth = LaunchConfiguration("gaussian_snapshot_qos_depth")
 
     declarations = [
         DeclareLaunchArgument("raw_imu_topic", default_value="/imu_for_gs"),
         DeclareLaunchArgument(
             "raw_pointcloud_topic", default_value="/points_for_gs"
         ),
+        DeclareLaunchArgument("raw_image_topic", default_value="/camera/image"),
+        DeclareLaunchArgument("raw_camera_info_topic", default_value="/camera/camera_info"),
+        DeclareLaunchArgument("deterministic_bag_path", default_value=""),
+        DeclareLaunchArgument("deterministic_feedback_bag_path", default_value=""),
+        DeclareLaunchArgument("replay_imu_topic", default_value="/imu"),
+        DeclareLaunchArgument("replay_lidar_topic", default_value="/livox/lidar"),
+        DeclareLaunchArgument("replay_image_topic", default_value="/camera/image"),
+        DeclareLaunchArgument(
+            "replay_camera_info_topic", default_value="/camera/camera_info"
+        ),
+        DeclareLaunchArgument("output_tum_path", default_value=""),
         DeclareLaunchArgument("external_odometry_prior_topic", default_value=""),
         DeclareLaunchArgument("enable_external_odometry_prior", default_value="false"),
         DeclareLaunchArgument("enable_external_odometry_position_factors", default_value="false"),
@@ -144,6 +173,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("rotation_smoothness_huber_delta_rad", default_value="0.0"),
         DeclareLaunchArgument("lidar_huber_delta_m", default_value="0.10"),
         DeclareLaunchArgument("step_period_seconds", default_value="0.10"),
+        DeclareLaunchArgument("use_stamp_driven_steps", default_value="false"),
+        DeclareLaunchArgument("max_stamp_driven_steps_per_callback", default_value="4"),
+        DeclareLaunchArgument("pose_output_period_seconds", default_value="0.0"),
+        DeclareLaunchArgument("max_path_history", default_value="5000"),
         DeclareLaunchArgument("output_max_pose_step_m", default_value="5.0"),
         DeclareLaunchArgument("output_max_velocity_mps", default_value="0.0"),
         DeclareLaunchArgument("output_max_position_abs_m", default_value="1000000.0"),
@@ -162,6 +195,7 @@ def generate_launch_description() -> LaunchDescription:
             "apply_position_update_on_rotation_reject", default_value="false"
         ),
         DeclareLaunchArgument("apply_limited_rotation_update", default_value="false"),
+        DeclareLaunchArgument("apply_limited_position_update", default_value="false"),
         DeclareLaunchArgument("scale_position_with_limited_rotation", default_value="true"),
         DeclareLaunchArgument("pointcloud_enable", default_value="true"),
         DeclareLaunchArgument("pointcloud_subsample_stride", default_value="50"),
@@ -211,6 +245,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("persistent_plane_map_min_observations_for_match", default_value="3"),
         DeclareLaunchArgument("body_frame_id", default_value="imu_link"),
         DeclareLaunchArgument("world_frame_id", default_value="map"),
+        DeclareLaunchArgument(
+            "gaussian_map_topic", default_value="/gaussian_lic/gaussian_map"
+        ),
+        DeclareLaunchArgument("gaussian_snapshot_qos_depth", default_value="64"),
     ]
 
     node = Node(
@@ -222,6 +260,15 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "raw_imu_topic": raw_imu_topic,
                 "raw_pointcloud_topic": raw_pointcloud_topic,
+                "raw_image_topic": raw_image_topic,
+                "raw_camera_info_topic": raw_camera_info_topic,
+                "deterministic_bag_path": deterministic_bag_path,
+                "deterministic_feedback_bag_path": deterministic_feedback_bag_path,
+                "replay_imu_topic": replay_imu_topic,
+                "replay_lidar_topic": replay_lidar_topic,
+                "replay_image_topic": replay_image_topic,
+                "replay_camera_info_topic": replay_camera_info_topic,
+                "output_tum_path": output_tum_path,
                 "external_odometry_prior_topic": external_odometry_prior_topic,
                 "enable_external_odometry_prior": enable_external_odometry_prior,
                 "enable_external_odometry_position_factors": enable_external_odometry_position_factors,
@@ -246,6 +293,10 @@ def generate_launch_description() -> LaunchDescription:
                 "rotation_smoothness_huber_delta_rad": rotation_smoothness_huber_delta_rad,
                 "lidar_huber_delta_m": lidar_huber_delta_m,
                 "step_period_seconds": step_period_seconds,
+                "use_stamp_driven_steps": use_stamp_driven_steps,
+                "max_stamp_driven_steps_per_callback": max_stamp_driven_steps_per_callback,
+                "pose_output_period_seconds": pose_output_period_seconds,
+                "max_path_history": max_path_history,
                 "output_max_pose_step_m": output_max_pose_step_m,
                 "output_max_velocity_mps": output_max_velocity_mps,
                 "output_max_position_abs_m": output_max_position_abs_m,
@@ -262,6 +313,7 @@ def generate_launch_description() -> LaunchDescription:
                 "position_extrapolation_damping": position_extrapolation_damping,
                 "apply_position_update_on_rotation_reject": apply_position_update_on_rotation_reject,
                 "apply_limited_rotation_update": apply_limited_rotation_update,
+                "apply_limited_position_update": apply_limited_position_update,
                 "scale_position_with_limited_rotation": scale_position_with_limited_rotation,
                 "pointcloud_enable": pointcloud_enable,
                 "pointcloud_subsample_stride": pointcloud_subsample_stride,
@@ -311,6 +363,8 @@ def generate_launch_description() -> LaunchDescription:
                 "persistent_plane_map_min_observations_for_match": LaunchConfiguration("persistent_plane_map_min_observations_for_match"),
                 "body_frame_id": body_frame_id,
                 "world_frame_id": world_frame_id,
+                "gaussian_map_topic": gaussian_map_topic,
+                "gaussian_snapshot_qos_depth": gaussian_snapshot_qos_depth,
             }
         ],
     )

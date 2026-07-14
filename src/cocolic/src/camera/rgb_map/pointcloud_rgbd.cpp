@@ -47,10 +47,36 @@ Dr. Fu Zhang < fuzhang@hku.hk >.
 */
 #include "pointcloud_rgbd.hpp"
 #include "../optical_flow/lkpyramid.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 extern Common_tools::Cost_time_logger g_cost_time_logger;
 extern std::shared_ptr<Common_tools::ThreadPool> m_thread_pool_ptr;
 cv::RNG g_rng = cv::RNG(0);
 // std::atomic<long> g_pts_index(0);
+
+namespace
+{
+std::filesystem::path PcdOutputPath(const std::string &directory,
+                                    const std::string &file_name)
+{
+    const std::filesystem::path root = directory.empty()
+        ? std::filesystem::current_path() : std::filesystem::path(directory);
+    std::filesystem::path relative = file_name.empty()
+        ? std::filesystem::path("rgb_pt") : std::filesystem::path(file_name);
+    if (relative.is_absolute()) relative = relative.relative_path();
+    std::filesystem::path output = root / relative;
+    if (output.extension() != ".pcd") output += ".pcd";
+    return output.lexically_normal();
+}
+} // namespace
 
 void RGB_pts::set_pos(const vec_3 &pos)
 {
@@ -173,36 +199,33 @@ Global_map::Global_map( int if_start_service )
     m_mutex_rgb_pts_in_recent_hitted_boxes = std::make_shared< std::mutex >();
     m_mutex_m_box_recent_hitted = std::make_shared< std::mutex >();
     m_mutex_pts_last_visited = std::make_shared< std::mutex >();
-    // Allocate memory for pointclouds
-    if ( Common_tools::get_total_phy_RAM_size_in_GB() < 12 )
-    {
-        scope_color( ANSI_COLOR_RED_BOLD );
-        std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
-        cout << "+++++++++++++++++++++++++++++++++++++++++++++++++++" << endl;
-        cout << "I have detected your physical memory smaller than 12GB (currently: " << Common_tools::get_total_phy_RAM_size_in_GB()
-             << "GB). I recommend you to add more physical memory for improving the overall performance of R3LIVE." << endl;
-        cout << "+++++++++++++++++++++++++++++++++++++++++++++++++++" << endl;
-        std::this_thread::sleep_for( std::chrono::seconds( 5 ) );
-        m_rgb_pts_vec.reserve( 1e8 );
-    }
-    else
-    {
-        m_rgb_pts_vec.reserve( 1e9 );
-    }
+    // Keep startup deterministic and container-friendly. The upstream fixed
+    // reserve (1e8/1e9 shared_ptrs) requested roughly 1.6/16 GB immediately
+    // and could throw before processing the first frame. std::vector grows as
+    // needed; one million entries amortizes normal map growth at ~16 MB.
+    m_rgb_pts_vec.reserve( 1000000 );
     // m_rgb_pts_in_recent_visited_voxels.reserve( 1e6 );
     if ( if_start_service )
     {
+        m_stop_service.store( false, std::memory_order_release );
         m_thread_service = std::make_shared< std::thread >( &Global_map::service_refresh_pts_for_projection, this );
     }
 }
-Global_map::~Global_map(){};
+Global_map::~Global_map()
+{
+    m_stop_service.store( true, std::memory_order_release );
+    if ( m_thread_service && m_thread_service->joinable() )
+    {
+        m_thread_service->join();
+    }
+}
 
 void Global_map::service_refresh_pts_for_projection()
 {
     eigen_q last_pose_q = eigen_q::Identity();
     Common_tools::Timer                timer;
     std::shared_ptr< Image_frame > img_for_projection = std::make_shared< Image_frame >();
-    while (1)
+    while ( !m_stop_service.load( std::memory_order_acquire ) )
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         m_mutex_img_pose_for_projection->lock();
@@ -500,7 +523,9 @@ void Global_map::render_pts_in_voxels(std::shared_ptr<Image_frame> &img_ptr, std
     // cout << "Total hit count = " << hit_count << endl;
 }
 
-Common_tools::Cost_time_logger cost_time_logger_render("/home/ziv/temp/render_thr.log");
+// Runtime timing remains available in memory without writing outside the
+// caller-selected output directory during static initialization.
+Common_tools::Cost_time_logger cost_time_logger_render;
 
 std::atomic<long> render_pts_count ;
 static inline double thread_render_pts_in_voxel(const int & pt_start, const int & pt_end, const std::shared_ptr<Image_frame> & img_ptr,
@@ -665,6 +690,19 @@ void Global_map::selection_points_for_projection( bool is_3dgs, Eigen::aligned_v
         pts_for_projection = m_rgb_pts_vec;  //
     }
 
+    // m_voxels_recent_visited is an unordered_set of shared_ptrs, so its
+    // iteration order depends on process-local addresses. Pixel occupancy is
+    // first/depth wins below; impose the stable map insertion index before
+    // that selection so identical bags produce identical visual factors.
+    pts_for_projection.erase(
+        std::remove(pts_for_projection.begin(), pts_for_projection.end(), nullptr),
+        pts_for_projection.end());
+    std::sort(pts_for_projection.begin(), pts_for_projection.end(),
+              [](const RGB_pt_ptr &lhs, const RGB_pt_ptr &rhs)
+              {
+                  return lhs->m_pt_index < rhs->m_pt_index;
+              });
+
     ///
     int pts_size = pts_for_projection.size();  //
     double m_min = m_minimum_depth_for_projection;
@@ -730,56 +768,86 @@ void Global_map::selection_points_for_projection( bool is_3dgs, Eigen::aligned_v
 void Global_map::save_to_pcd(std::string dir_name, std::string _file_name, int save_pts_with_views )
 {
     Common_tools::Timer tim;
-    Common_tools::create_dir(dir_name);
-    std::string file_name = std::string(dir_name).append(_file_name);
+    const std::filesystem::path file_name = PcdOutputPath(dir_name, _file_name);
+    std::error_code ec;
+    std::filesystem::create_directories(file_name.parent_path(), ec);
+    if (ec)
+        throw std::runtime_error("Unable to create PCD output directory '" +
+                                 file_name.parent_path().string() + "': " + ec.message());
     scope_color(ANSI_COLOR_BLUE_BOLD);
-    cout << "Save Rgb points to " << file_name << endl;
+    cout << "Save Rgb points to " << file_name.string() << endl;
     fflush(stdout);
-    pcl::PointCloud<pcl::PointXYZRGB> pc_rgb;
-    long pt_size = m_rgb_pts_vec.size();
-    pc_rgb.resize(pt_size);
-    long pt_count = 0;
-    for (long i = pt_size - 1; i > 0; i--)
-    //for (int i = 0; i  <  pt_size; i++)
-    {
-        if ( i % 1000 == 0)
-        {
-            cout << ANSI_DELETE_CURRENT_LINE << "Saving offline map " << (int)( (pt_size- 1 -i ) * 100.0 / (pt_size-1) ) << " % ...";
-            fflush(stdout);
-        }
 
-        if (m_rgb_pts_vec[i]->m_N_rgb < save_pts_with_views)
+    struct PcdPoint
+    {
+        float x, y, z, rgb;
+    };
+    static_assert(sizeof(PcdPoint) == 16, "PCD point layout must remain packed");
+    std::vector<PcdPoint> points;
+    {
+        std::lock_guard<std::mutex> lock(*m_mutex_pts_vec);
+        points.reserve(m_rgb_pts_vec.size());
+        for (auto it = m_rgb_pts_vec.rbegin(); it != m_rgb_pts_vec.rend(); ++it)
         {
-            continue;
+            const auto &source = *it;
+            if (!source || source->m_N_rgb < save_pts_with_views) continue;
+            const auto channel = [](double value) {
+                return static_cast<uint32_t>(std::clamp(std::lround(value), 0L, 255L));
+            };
+            const uint32_t packed_rgb = (channel(source->m_rgb[2]) << 16) |
+                                        (channel(source->m_rgb[1]) << 8) |
+                                        channel(source->m_rgb[0]);
+            PcdPoint point{static_cast<float>(source->m_pos[0]),
+                           static_cast<float>(source->m_pos[1]),
+                           static_cast<float>(source->m_pos[2]), 0.0F};
+            std::memcpy(&point.rgb, &packed_rgb, sizeof(packed_rgb));
+            points.push_back(point);
         }
-        pcl::PointXYZRGB pt;
-        pc_rgb.points[ pt_count ].x = m_rgb_pts_vec[ i ]->m_pos[ 0 ];
-        pc_rgb.points[ pt_count ].y = m_rgb_pts_vec[ i ]->m_pos[ 1 ];
-        pc_rgb.points[ pt_count ].z = m_rgb_pts_vec[ i ]->m_pos[ 2 ];
-        pc_rgb.points[ pt_count ].r = m_rgb_pts_vec[ i ]->m_rgb[ 2 ];
-        pc_rgb.points[ pt_count ].g = m_rgb_pts_vec[ i ]->m_rgb[ 1 ];
-        pc_rgb.points[ pt_count ].b = m_rgb_pts_vec[ i ]->m_rgb[ 0 ];
-        pt_count++;
     }
-    cout << ANSI_DELETE_CURRENT_LINE  << "Saving offline map 100% ..." << endl;
-    pc_rgb.resize(pt_count);
-    cout << "Total have " << pt_count << " points." << endl;
+    cout << "Total have " << points.size() << " points." << endl;
     tim.tic();
-    cout << "Now write to: " << file_name << endl;
-    // ROS2 port: pcl::io::savePCDFileBinary disabled — it forces linking libpcl_io
-    // (→ system gdal/hdf5 whose libcurl clashes with conda). This is an offline
-    // RGB-map export utility, not on the odometry path.
-    // pcl::io::savePCDFileBinary(std::string(file_name).append(".pcd"), pc_rgb);
-    cout << "[ROS2 port] savePCDFileBinary disabled (offline map export).\n";
+    cout << "Now write to: " << file_name.string() << endl;
+    std::ofstream output(file_name, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error("Unable to open PCD output '" + file_name.string() + "'");
+    output << "# .PCD v0.7 - Point Cloud Data file format\n"
+           << "VERSION 0.7\n"
+           << "FIELDS x y z rgb\n"
+           << "SIZE 4 4 4 4\n"
+           << "TYPE F F F F\n"
+           << "COUNT 1 1 1 1\n"
+           << "WIDTH " << points.size() << "\n"
+           << "HEIGHT 1\n"
+           << "VIEWPOINT 0 0 0 1 0 0 0\n"
+           << "POINTS " << points.size() << "\n"
+           << "DATA binary\n";
+    if (!points.empty())
+        output.write(reinterpret_cast<const char *>(points.data()),
+                     static_cast<std::streamsize>(points.size() * sizeof(PcdPoint)));
+    output.close();
+    if (!output)
+        throw std::runtime_error("Failed while writing PCD output '" + file_name.string() + "'");
     cout << "Save PCD cost time = " << tim.toc() << endl;
 }
 
-void Global_map::save_and_display_pointcloud(std::string dir_name, std::string file_name, int save_pts_with_views)
+void Global_map::save_and_display_pointcloud(std::string dir_name, std::string file_name,
+                                             int save_pts_with_views, bool display)
 {
     save_to_pcd(dir_name, file_name, save_pts_with_views);
+    if (!display) return;
+    const std::filesystem::path output = PcdOutputPath(dir_name, file_name);
     scope_color(ANSI_COLOR_WHITE_BOLD);
     cout << "========================================================" << endl;
     cout << "Open pcl_viewer to display point cloud, close the viewer's window to continue mapping process ^_^" << endl;
     cout << "========================================================" << endl;
-    system(std::string("pcl_viewer ").append(dir_name).append("/rgb_pt.pcd").c_str());
+    const pid_t pid = fork();
+    if (pid < 0) throw std::runtime_error("Unable to start optional pcl_viewer");
+    if (pid == 0)
+    {
+        execlp("pcl_viewer", "pcl_viewer", output.c_str(), static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        throw std::runtime_error("Optional pcl_viewer failed for '" + output.string() + "'");
 }

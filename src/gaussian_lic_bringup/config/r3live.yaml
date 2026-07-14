@@ -78,7 +78,7 @@ mapping_node:
     torch_gaussian_optimization_max_samples: 4096
     torch_gaussian_optimization_sampling: upstream_random
     torch_gaussian_optimization_seed: 20260505
-    enable_torch_gaussian_pruning: true
+    enable_torch_gaussian_pruning: false
     torch_gaussian_prune_min_opacity: 0.005
     torch_gaussian_max_foreground: 1500000
     torch_gaussian_prune_count_policy: uniform
@@ -88,6 +88,9 @@ mapping_node:
     skybox_points_num: 0
     skybox_radius: 1000.0
     torch_gaussian_device: cuda
+    save_map_render_evaluation: true
+    lpips_model_path: ""
+    test_frame_stride: 1
     gaussian_map_chunk_size: 1024
     max_path_length: 5000
     max_map_points: 200000

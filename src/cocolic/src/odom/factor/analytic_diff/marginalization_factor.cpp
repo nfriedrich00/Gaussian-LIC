@@ -18,6 +18,7 @@
 
 #include "marginalization_factor.h"
 #include <iomanip>
+#include <unordered_set>
 
 void ResidualBlockInfo::Evaluate() {
   //
@@ -71,11 +72,18 @@ void ResidualBlockInfo::Evaluate() {
 MarginalizationInfo::~MarginalizationInfo() {
   for (auto it = parameter_block_data.begin(); it != parameter_block_data.end();
        ++it) {
-    delete it->second;
+    delete[] it->second;
   }
 
+  std::unordered_set<ceres::CostFunction *> deleted_costs;
+  std::unordered_set<ceres::LossFunction *> deleted_losses;
   for (int i = 0; i < (int)factors.size(); i++) {
-    delete factors[i]->cost_function;
+    if (factors[i]->cost_function &&
+        deleted_costs.insert(factors[i]->cost_function).second)
+      delete factors[i]->cost_function;
+    if (factors[i]->loss_function &&
+        deleted_losses.insert(factors[i]->loss_function).second)
+      delete factors[i]->loss_function;
     delete factors[i];
   }
 }
@@ -202,6 +210,7 @@ bool MarginalizationInfo::marginalize() {
   //
   TicToc t_thread_summing;
   pthread_t tids[NUM_THREADS];
+  bool thread_started[NUM_THREADS] = {};
   ThreadsStruct threadsstruct[NUM_THREADS];
   int i = 0;
   for (auto it : factors) {
@@ -217,14 +226,17 @@ bool MarginalizationInfo::marginalize() {
     threadsstruct[i].parameter_block_idx = parameter_block_idx;
     int ret = pthread_create(&tids[i], NULL, ThreadsConstructA, (void *)&(threadsstruct[i]));
     if (ret != 0) {
-      // LOG(WARNING) << "pthread_create error";
-      break;
+      // Preserve the complete normal-equation sum under resource pressure: only
+      // this failed partition is evaluated synchronously.
+      ThreadsConstructA(static_cast<void *>(&threadsstruct[i]));
+    } else {
+      thread_started[i] = true;
     }
   }
   //
   for (int i = NUM_THREADS - 1; i >= 0; i--)
   {
-    pthread_join(tids[i], NULL);
+    if (thread_started[i]) pthread_join(tids[i], NULL);
     A += threadsstruct[i].A;
     b += threadsstruct[i].b;
   }

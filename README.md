@@ -50,15 +50,56 @@ git clone https://github.com/KaiFeng-Frank/gaussian_lic_ros2.git
 cd gaussian_lic_ros2
 
 source /opt/ros/jazzy/setup.bash
-./scripts/build_ros2.sh
+# The full build installs the upstream LPIPS asset from this checkout.
+./scripts/fetch_upstreams.sh
+sudo apt update
+sudo apt install -y python3-rosdep
+# First use only: sudo rosdep init
+rosdep update
+rosdep install --from-paths src --ignore-src -r -y
+# Uses CUDA_HOME (default /usr/local/cuda-12.8) and
+# TORCH_DIR (default ~/Software/libtorch/share/cmake/Torch).
+./scripts/build_ros2.sh --full
 source install/setup.bash
-./scripts/smoke_test.sh --tf
+./scripts/smoke_test.sh --torch --render-mode rasterizer --tf
 ```
+
+Use `./scripts/build_ros2.sh --full --with-tensorrt` for any dataset profile
+whose `depth_completion` setting is `true`. The launch file accepts
+`depth_completion_engine_path:=...`; when that value is empty it checks
+`GAUSSIAN_LIC_SPNET_ENGINE`, then the matching
+`~/Software/TensorRT-engines/spnet_<height>_<width>_fp16.engine`. A requested
+SPNet path now fails at startup if TensorRT or the engine is unavailable instead
+of silently running a different sparse-depth pipeline. Explicitly set
+`depth_completion:=false` when that fallback is intentional.
+
+On the verified local machine, both `spnet_512_640_fp16.engine` and
+`spnet_480_640_fp16.engine` already exist in that directory. TensorRT plans are
+GPU/runtime-specific; see [`docs/SPNET_RUNTIME_STATUS.md`](docs/SPNET_RUNTIME_STATUS.md)
+for their hashes and the local generation commands instead of copying a plan to
+different hardware.
+
+The real dataset profiles also retain the upstream end-of-run visual-quality
+stage. The bundled `lpips_alex.pt` is installed with the mapper and may be
+overridden with `lpips_model_path:=...` or `GAUSSIAN_LIC_LPIPS_MODEL`. Final
+output contains both the ROS2 `renders/` name used by the validation scripts and
+an upstream-compatible `render/` alias, plus `gt/`, `render_depth/`, and the
+metrics manifest. Evaluation-owned directories are replaced on each save so
+stale frames cannot contaminate a result.
+
+CI and middleware-only development use
+`./scripts/build_ros2.sh --cpu-only`; attempting to launch the real rasterizer
+from that build fails immediately with an actionable rebuild message.
+
+The mapper's ROS1/ROS2 algorithm boundary, including SPNet sampling, CUDA
+optimization, exposure, density-control opt-ins, final evaluation, and
+inactivity finalization, is documented in
+[`docs/GAUSSIAN_MAPPER_PARITY.md`](docs/GAUSSIAN_MAPPER_PARITY.md).
 
 Run the native tracking probe suite:
 
 ```bash
-colcon test --packages-select gaussian_lic_tracking --event-handlers console_direct+
+colcon test --event-handlers console_direct+
 colcon test-result --verbose
 ```
 

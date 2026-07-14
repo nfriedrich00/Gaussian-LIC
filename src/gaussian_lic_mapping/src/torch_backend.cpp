@@ -170,23 +170,15 @@ GaussianTensorPack make_foreground_tensors_from_pending_indices(
   auto xyz = torch::from_blob(xyz_values.data(), {num, 3}, cpu_options).clone().to(device);
   auto features = torch::from_blob(
     feature_values.data(), {num, 3, sh_coeff_count}, cpu_options).clone().to(device);
-  torch::Tensor scaling;
-#ifdef GAUSSIAN_LIC_ENABLE_CUDA
-  if (device.is_cuda() && num >= 4) {
-    const auto dist2 = cuda_ops::dist_cuda2(xyz).clamp_min(1.0e-7F);
-    scaling = torch::log(torch::sqrt(dist2) * static_cast<float>(scaling_scale))
-      .unsqueeze(1)
-      .repeat({1, 3})
-      .contiguous();
-  } else
-#endif
-  {
-    scaling = torch::from_blob(scale_values.data(), {num}, cpu_options)
-      .clone()
-      .to(device)
-      .unsqueeze(1)
-      .repeat({1, 3});
-  }
+  // Gaussian-LIC initializes and extends foreground scales from the LiDAR
+  // point depth in the current response frame.  KNN initialization (the
+  // common vanilla 3DGS policy) changes the algorithm and is intentionally
+  // not used here, including on CUDA.
+  torch::Tensor scaling = torch::from_blob(scale_values.data(), {num}, cpu_options)
+    .clone()
+    .to(device)
+    .unsqueeze(1)
+    .repeat({1, 3});
 
   auto rotation = torch::zeros({num, 4}, cpu_options.device(device));
   rotation.index_put_({torch::indexing::Slice(), 0}, 1.0F);
@@ -265,10 +257,21 @@ GaussianTensorPack make_skybox_tensors(
   features.index_put_({torch::indexing::Slice(), 1, 0}, 0.8F);
   features.index_put_({torch::indexing::Slice(), 2, 0}, 0.95F);
 
-  constexpr double sphere_area = 4.0 * 3.14159265358979323846;
-  const double angular_spacing = std::sqrt(sphere_area / static_cast<double>(skybox_points_num));
-  const float scale_seed = static_cast<float>(std::max(radius * angular_spacing, 1e-6));
-  auto scaling = std::log(scale_seed) * torch::ones({num, 3}, options);
+  torch::Tensor scaling;
+#ifdef GAUSSIAN_LIC_ENABLE_CUDA
+  if (device.is_cuda() && num >= 4) {
+    // Unlike foreground points, upstream Gaussian-LIC intentionally uses
+    // simple-knn spacing for the randomly sampled sky sphere.
+    scaling = torch::log(torch::sqrt(cuda_ops::dist_cuda2(xyz.clone()).clamp_min(1.0e-7F)))
+      .unsqueeze(1).repeat({1, 3}).contiguous();
+  } else
+#endif
+  {
+    constexpr double sphere_area = 4.0 * 3.14159265358979323846;
+    const double angular_spacing = std::sqrt(sphere_area / static_cast<double>(skybox_points_num));
+    const float scale_seed = static_cast<float>(std::max(radius * angular_spacing, 1e-6));
+    scaling = std::log(scale_seed) * torch::ones({num, 3}, options);
+  }
   auto rotation = torch::zeros({num, 4}, options);
   rotation.index_put_({torch::indexing::Slice(), 0}, 1.0F);
   auto opacity = inverse_sigmoid(0.7F * torch::ones({num, 1}, options));
@@ -301,12 +304,16 @@ void require_grad_for_map(TorchGaussianMap & map)
   map.scaling = map.scaling.contiguous().requires_grad_();
   map.rotation = map.rotation.contiguous().requires_grad_();
   map.opacity = map.opacity.contiguous().requires_grad_();
+  if (map.exposure.defined()) {
+    map.exposure = map.exposure.contiguous().requires_grad_();
+  }
 }
 
 void zero_gaussian_gradients(TorchGaussianMap & map)
 {
   for (auto * tensor : {
-      &map.xyz, &map.features_dc, &map.features_rest, &map.scaling, &map.rotation, &map.opacity})
+      &map.xyz, &map.features_dc, &map.features_rest, &map.scaling, &map.rotation, &map.opacity,
+      &map.exposure})
   {
     if (tensor->defined() && tensor->grad().defined()) {
       tensor->grad().zero_();
@@ -330,6 +337,11 @@ void validate_gaussian_map_for_optimization(const TorchGaussianMap & map)
   }
   if (map.xyz.size(0) != map.features_dc.size(0) || map.xyz.size(0) != map.opacity.size(0)) {
     throw std::runtime_error("Gaussian optimization tensors have inconsistent point counts");
+  }
+  if (map.exposure.defined() && (map.exposure.dim() != 2 || map.exposure.size(0) != 3 ||
+    map.exposure.size(1) != 4))
+  {
+    throw std::runtime_error("Gaussian exposure tensor must have shape [3, 4]");
   }
 }
 
@@ -467,10 +479,38 @@ TorchGaussianMap make_foreground_visibility_map(const TorchGaussianMap & map)
   foreground.scaling = map.scaling.index({foreground_slice}).contiguous();
   foreground.rotation = map.rotation.index({foreground_slice}).contiguous();
   foreground.opacity = map.opacity.index({foreground_slice}).contiguous();
+  foreground.exposure = map.exposure;
   foreground.sh_degree = map.sh_degree;
   foreground.foreground_count = static_cast<size_t>(std::max<int64_t>(total_count - foreground_start, 0));
   foreground.skybox_count = 0U;
   return foreground;
+}
+
+torch::Tensor apply_exposure_transform(
+  const torch::Tensor & rgb,
+  const TorchGaussianMap & map,
+  const GaussianBackendConfig & config)
+{
+  if (!config.apply_exposure) {
+    return rgb;
+  }
+  if (!map.exposure.defined() || map.exposure.dim() != 2 ||
+    map.exposure.size(0) != 3 || map.exposure.size(1) != 4)
+  {
+    throw std::runtime_error("apply_exposure requires an initialized [3, 4] exposure tensor");
+  }
+  const auto linear = map.exposure.index({
+      torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
+  const auto bias = map.exposure.index({torch::indexing::Slice(), 3});
+  if (rgb.dim() >= 2 && rgb.size(0) == 3) {
+    const auto flattened = rgb.reshape({3, -1});
+    const auto transformed = torch::matmul(linear, flattened) + bias.unsqueeze(1);
+    return torch::clamp(transformed.reshape_as(rgb), 0.0F, 1.0F);
+  }
+  if (rgb.dim() == 2 && rgb.size(1) == 3) {
+    return torch::clamp(torch::matmul(rgb, linear.transpose(0, 1)) + bias, 0.0F, 1.0F);
+  }
+  throw std::runtime_error("exposure transform expects RGB data shaped [3,...] or [N,3]");
 }
 
 void select_gaussian_topology(TorchGaussianMap & map, const torch::Tensor & keep_indices, const size_t kept_foreground)
@@ -584,9 +624,6 @@ VisibilityProjection project_visible_gaussians(
   const auto v_idx = torch::round(v).to(torch::kLong);
 
   auto depth_valid = torch::logical_and(z.gt(1.0e-3), torch::isfinite(z));
-  if (config.max_depth > 0.0) {
-    depth_valid = torch::logical_and(depth_valid, z.lt(config.max_depth));
-  }
   const auto finite = torch::logical_and(
     depth_valid,
     torch::logical_and(torch::isfinite(u), torch::isfinite(v)));
@@ -661,7 +698,6 @@ torch::Tensor gather_camera_targets(
     .detach();
 }
 
-#ifdef GAUSSIAN_LIC_ENABLE_CUDA
 void ensure_adam_pair(
   const torch::Tensor & parameter,
   torch::Tensor & exp_avg,
@@ -685,8 +721,34 @@ void ensure_sparse_adam_state(TorchGaussianMap & map)
   ensure_adam_pair(map.scaling, map.scaling_exp_avg, map.scaling_exp_avg_sq);
   ensure_adam_pair(map.rotation, map.rotation_exp_avg, map.rotation_exp_avg_sq);
   ensure_adam_pair(map.opacity, map.opacity_exp_avg, map.opacity_exp_avg_sq);
+  if (map.exposure.defined()) {
+    ensure_adam_pair(map.exposure, map.exposure_exp_avg, map.exposure_exp_avg_sq);
+  }
 }
 
+void dense_exposure_adam_step_if_enabled(
+  TorchGaussianMap & map,
+  const double learning_rate)
+{
+  if (learning_rate <= 0.0 || !map.exposure.defined() || !map.exposure.grad().defined()) {
+    return;
+  }
+  ensure_adam_pair(map.exposure, map.exposure_exp_avg, map.exposure_exp_avg_sq);
+  constexpr double beta1 = 0.9;
+  constexpr double beta2 = 0.999;
+  constexpr double epsilon = 1.0e-8;
+  const auto gradient = map.exposure.grad();
+  map.exposure_exp_avg.mul_(beta1).add_(gradient, 1.0 - beta1);
+  map.exposure_exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, 1.0 - beta2);
+  ++map.exposure_step;
+  const double bias_correction1 = 1.0 - std::pow(beta1, static_cast<double>(map.exposure_step));
+  const double bias_correction2 = 1.0 - std::pow(beta2, static_cast<double>(map.exposure_step));
+  const double step_size = learning_rate * std::sqrt(bias_correction2) / bias_correction1;
+  const auto denominator = torch::sqrt(map.exposure_exp_avg_sq) + epsilon;
+  map.exposure.addcdiv_(map.exposure_exp_avg, denominator, -step_size);
+}
+
+#ifdef GAUSSIAN_LIC_ENABLE_CUDA
 void sparse_adam_step_if_enabled(
   torch::Tensor & parameter,
   torch::Tensor & exp_avg,
@@ -801,7 +863,7 @@ rasterize_gaussian_map(
   const auto rotation = torch::nn::functional::normalize(
     map.rotation,
     torch::nn::functional::NormalizeFuncOptions().p(2.0).dim(1)).contiguous();
-  return rasterizer.forward(
+  auto result = rasterizer.forward(
     map.xyz,
     means2d,
     opacity,
@@ -811,6 +873,8 @@ rasterize_gaussian_map(
     scaling,
     rotation,
     cov3d_precomp);
+  std::get<0>(result) = apply_exposure_transform(std::get<0>(result), map, config);
+  return result;
 }
 
 std::vector<size_t> select_pending_points_in_alpha_holes(
@@ -826,8 +890,9 @@ std::vector<size_t> select_pending_points_in_alpha_holes(
     return {};
   }
 
-  const auto visibility_map = make_foreground_visibility_map(map);
-  auto render_result = rasterize_gaussian_map(visibility_map, camera, config, device);
+  // ROS1 renders the complete model (including an optional skybox) before
+  // testing the 0.99 alpha-hole threshold.
+  auto render_result = rasterize_gaussian_map(map, camera, config, device);
   const auto alpha = (1.0F - std::get<3>(render_result).detach())
     .clamp(0.0F, 1.0F)
     .to(torch::kCPU)
@@ -990,6 +1055,9 @@ TorchOptimizationResult optimize_gaussian_map_with_cuda_rasterizer(
         map.scaling, map.scaling_exp_avg, map.scaling_exp_avg_sq, visible_mask, config.scaling_lr);
       sparse_adam_step_if_enabled(
         map.rotation, map.rotation_exp_avg, map.rotation_exp_avg_sq, visible_mask, config.rotation_lr);
+      if (config.apply_exposure) {
+        dense_exposure_adam_step_if_enabled(map, config.exposure_lr);
+      }
       result.photometric_l1 = l1.detach().to(torch::kCPU).item<float>();
     }
     ++result.steps;
@@ -1114,7 +1182,7 @@ TorchGaussianMap initialize_gaussian_map(
   const double fy,
   torch::Device device)
 {
-  return initialize_gaussian_map(
+  TorchGaussianMap map = initialize_gaussian_map(
     dataset,
     config.sh_degree,
     config.scaling_scale,
@@ -1123,6 +1191,12 @@ TorchGaussianMap initialize_gaussian_map(
     device,
     config.skybox_points_num,
     config.skybox_radius);
+  if (config.apply_exposure) {
+    const auto options = map.xyz.options().dtype(torch::kFloat32);
+    map.exposure = torch::cat({
+      torch::eye(3, options), torch::zeros({3, 1}, options)}, 1).requires_grad_();
+  }
+  return map;
 }
 
 size_t append_pending_points_to_gaussian_map(
@@ -1241,7 +1315,8 @@ TorchOptimizationResult optimize_gaussian_map_from_camera(
   }
   if (
     config.position_lr <= 0.0 && config.feature_lr <= 0.0 && config.opacity_lr <= 0.0 &&
-    config.scaling_lr <= 0.0 && config.rotation_lr <= 0.0)
+    config.scaling_lr <= 0.0 && config.rotation_lr <= 0.0 &&
+    (!config.apply_exposure || config.exposure_lr <= 0.0))
   {
     throw std::runtime_error("photometric optimization requires at least one positive Gaussian learning rate");
   }
@@ -1277,7 +1352,8 @@ TorchOptimizationResult optimize_gaussian_map_from_camera(
   for (int step = 0; step < steps; ++step) {
     zero_gaussian_gradients(map);
     const auto dc = map.features_dc.index_select(0, gaussian_indices).select(1, 0);
-    const auto predicted = torch::clamp(dc * sh_c0 + 0.5F, 0.0F, 1.0F);
+    const auto predicted = apply_exposure_transform(
+      torch::clamp(dc * sh_c0 + 0.5F, 0.0F, 1.0F), map, config);
     auto loss = torch::mean(torch::abs(predicted - targets));
     if (config.opacity_lr > 0.0) {
       const auto opacity = map.opacity.index_select(0, gaussian_indices);
@@ -1293,6 +1369,9 @@ TorchOptimizationResult optimize_gaussian_map_from_camera(
       }
       if (config.opacity_lr > 0.0 && map.opacity.grad().defined()) {
         map.opacity.add_(map.opacity.grad(), -config.opacity_lr);
+      }
+      if (config.apply_exposure) {
+        dense_exposure_adam_step_if_enabled(map, config.exposure_lr);
       }
       result.photometric_l1 = loss.detach().to(torch::kCPU).item<float>();
     }

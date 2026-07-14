@@ -299,7 +299,7 @@ namespace cocolic
     ceres::Solver::Summary Solve(int max_iterations = 50, bool progress = false,
                                  int num_threads = -1);
 
-    void PrepareMarginalizationInfo(ResidualType r_type,
+    bool PrepareMarginalizationInfo(ResidualType r_type,
                                     ceres::CostFunction *cost_function,
                                     ceres::LossFunction *loss_function,
                                     std::vector<double *> &parameter_blocks,
@@ -323,14 +323,14 @@ namespace cocolic
     void AddControlPoints(const SplineMeta<SplineOrder> &spline_meta,
                           std::vector<double *> &vec, bool addPosKnot = false);
 
-    void PrepareMarginalizationInfo(ResidualType r_type,
+    bool PrepareMarginalizationInfo(ResidualType r_type,
                                     const SplineMeta<SplineOrder> &spline_meta,
                                     ceres::CostFunction *cost_function,
                                     ceres::LossFunction *loss_function,
                                     std::vector<double *> &parameter_blocks,
                                     std::vector<int> &drop_set_wo_ctrl_point);
 
-    void PrepareMarginalizationInfo(ResidualType r_type,
+    bool PrepareMarginalizationInfo(ResidualType r_type,
                                     ceres::CostFunction *cost_function,
                                     ceres::LossFunction *loss_function,
                                     std::vector<double *> &parameter_blocks,

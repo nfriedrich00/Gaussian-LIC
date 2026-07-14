@@ -48,7 +48,8 @@ unreachable for an independent ROS2 port** (proven, not hypothesized).
   PointCloud2), IMU initializer/state estimator, LiDAR handler.
 - **I/O glue (S5)**: `msg_manager` (rosbag2 reader, CDR deserialize, storage
   auto-detect for sqlite3/mcap), `odometry_manager` (finite `RunBag`),
-  `odometry_node` (rclcpp entry). RViz viewer stubbed.
+  `odometry_node` (rclcpp entry), native ROS 2 TF/odometry/path/cloud/image
+  publishers, launch file and installed RViz configuration.
 - **Camera (S4)**: slimmed R3LIVE visual front-end (optical-flow tracking + RGB map),
   feeding map-point→pixel correspondences to the ported image-feature factor.
 

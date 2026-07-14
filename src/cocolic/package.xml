@@ -3,9 +3,9 @@
 <package format="3">
   <name>cocolic</name>
   <version>0.0.1</version>
-  <description>Faithful mechanical ROS2 Jazzy port of upstream Coco-LIC (Gaussian-LIC2) — continuous-time LiDAR-Inertial-Camera odometry. Ported verbatim from external/Coco-LIC to reproduce upstream's exact trajectory (cm-scale vs the cocolic reference). Distinct from the independent gaussian_lic_tracking reimplementation.</description>
-  <maintainer email="tZYalsopphilarySWxCdP@reggaefan.com">frank</maintainer>
-  <license>GPLv3</license>
+  <description>ROS 2 Jazzy port of Coco-LIC continuous-time LiDAR-Inertial-Camera odometry with the Gaussian-LIC mapper interface.</description>
+  <maintainer email="kfeng8021@gmail.com">Frank</maintainer>
+  <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
@@ -13,6 +13,7 @@
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
@@ -24,13 +25,19 @@
   <depend>cv_bridge</depend>
   <depend>gaussian_lic_msgs</depend>
   <depend>pcl_conversions</depend>
+  <depend>eigen</depend>
   <depend>rosbag2_cpp</depend>
+  <depend>rosbag2_storage</depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <depend>libceres-dev</depend>
   <depend>libgoogle-glog-dev</depend>
   <depend>liblz4-dev</depend>
   <depend>libopencv-dev</depend>
   <depend>libpcl-all-dev</depend>
-  <depend>libyaml-cpp-dev</depend>
+  <depend>yaml-cpp</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

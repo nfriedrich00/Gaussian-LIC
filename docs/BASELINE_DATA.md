@@ -208,8 +208,8 @@ wrong source image. The reproduction report also uses decoded GT hashes to
 associate ROS1 and ROS2 render-pair identities before sampling render pairs.
 That step fills finite PSNR, SSIM, and LPIPS fields under
 `metrics.json::quality`. The target workstation uses
-`${HOME}/.cache/gaussian_lic_ros2/quality-cuda-venv/bin/python` for CUDA LPIPS
-(`torch 2.7.0+cu128`). If the requested CUDA LPIPS device is unavailable,
+`${HOME}/miniconda3/envs/active-gs-original/bin/python` for CUDA LPIPS
+(`torch 2.9.1+cu130`). If the requested CUDA LPIPS device is unavailable,
 `eval_render_quality.py` records the requested device and falls back to CPU
 instead of leaving LPIPS null. For CPU-only report environments, set
 `QUALITY_PYTHON=/path/to/python` with `torch`, `torchvision`, `numpy`, and

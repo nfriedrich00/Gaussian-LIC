@@ -22,6 +22,8 @@
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_storage/storage_options.hpp>
 #include <rclcpp/serialization.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -32,6 +34,11 @@
 #include <map>
 #include <memory>
 #include <vector>
+#include <unordered_map>
+
+#ifdef COCOLIC_HAS_LIVOX_ROS_DRIVER2
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#endif
 
 #include <lidar/livox_feature_extraction.h>
 #include <lidar/velodyne_feature_extraction.h>  // ROS2 port: enabled for M2DGR (Velodyne)
@@ -191,7 +198,8 @@ namespace cocolic
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     typedef std::shared_ptr<MsgManager> Ptr;
 
-    MsgManager(const YAML::Node &node, const std::string &config_path);
+    MsgManager(const YAML::Node &node, const std::string &config_path,
+               const rclcpp::Node::SharedPtr &ros_node = nullptr);
 
     //
     void SpinBagOnce();
@@ -206,34 +214,29 @@ namespace cocolic
 
     int NumLiDAR() const { return num_lidars_; }
 
-    inline void IMUMsgToIMUData(const sensor_msgs::msg::Imu::ConstSharedPtr &imu_msg,
-                                IMUData &data)
-    {
-      data.timestamp = (int64_t(imu_msg->header.stamp.sec) * 1000000000LL +
-                        int64_t(imu_msg->header.stamp.nanosec));
-      data.gyro = Eigen::Vector3d(imu_msg->angular_velocity.x,
-                                  imu_msg->angular_velocity.y,
-                                  imu_msg->angular_velocity.z);
-      if (if_normalized_)
-      {
-        data.accel = Eigen::Vector3d(imu_msg->linear_acceleration.x * 9.81,
-                                     imu_msg->linear_acceleration.y * 9.81,
-                                     imu_msg->linear_acceleration.z * 9.81);
-      }
-      else
-      {
-        data.accel = Eigen::Vector3d(imu_msg->linear_acceleration.x,
-                                     imu_msg->linear_acceleration.y,
-                                     imu_msg->linear_acceleration.z);
-      }
-      //  imu_msg->linear_acceleration.z + 9.81);
-      Eigen::Vector4d q(imu_msg->orientation.w, imu_msg->orientation.x,
-                        imu_msg->orientation.y, imu_msg->orientation.z);
-      if (std::fabs(q.norm() - 1) < 0.01)
-      {
-        data.orientation = SO3d(Eigen::Quaterniond(q[0], q[1], q[2], q[3]));
-      }
-    }
+    // Public for deterministic contract tests and external adapters. Invalid
+    // PointCloud2 layouts throw std::invalid_argument instead of silently
+    // corrupting per-point timing used by the continuous-time estimator.
+    static CustomMsgLite::Ptr PointCloud2ToCustomMsg(
+        const sensor_msgs::msg::PointCloud2 &pc);
+
+#ifdef COCOLIC_HAS_LIVOX_ROS_DRIVER2
+    static CustomMsgLite::Ptr LivoxCustomMsgToLite(
+        const livox_ros_driver2::msg::CustomMsg &msg);
+#endif
+
+    static cv::Mat DecodeCompressedImage(
+        const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg);
+
+    static bool IMUMsgToIMUData(
+        const sensor_msgs::msg::Imu::ConstSharedPtr &imu_msg, IMUData &data,
+        bool normalized_accel = false, bool *orientation_valid = nullptr,
+        std::string *error = nullptr);
+
+    // ROS topic names are absolute when configured with a leading slash;
+    // otherwise they are scoped under topic_prefix and normalized once.
+    static std::string ResolveTopic(const std::string &topic_prefix,
+                                    const std::string &configured_topic);
 
     static void CheckLidarMsgTimestamp(double ros_bag_time, double msg_time)
     {
@@ -271,10 +274,8 @@ namespace cocolic
 
     void ImageMsgHandle(const sensor_msgs::msg::Image::ConstSharedPtr &msg);
 
-    // ROS2 port: adapter from the offset_time_full PointCloud2 (20-byte stride,
-    // x/y/z + intensity/tag/line + offset_time) to the upstream CustomMsg surface.
-    static CustomMsgLite::Ptr PointCloud2ToCustomMsg(
-        const sensor_msgs::msg::PointCloud2 &pc);
+    void ImageMsgHandle(
+        const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg);
 
   public:
     bool has_valid_msg_;
@@ -323,6 +324,14 @@ namespace cocolic
     std::vector<LiDARType> lidar_types;
     std::vector<std::string> lidar_topics_;
     std::string image_topic_, image_topic_compressed_;
+    std::string debug_input_image_topic_;
+
+    rclcpp::Node::SharedPtr ros_node_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr
+        debug_input_image_pub_;
+    uint64_t invalid_imu_count_ = 0;
+    uint64_t nonmonotonic_imu_count_ = 0;
+    uint64_t invalid_imu_orientation_count_ = 0;
 
     // std::string pose_topic_;
 
@@ -332,12 +341,13 @@ namespace cocolic
     Eigen::aligned_vector<Eigen::Matrix4d> T_LktoL0_vec_;
 
     // ROS2 port: ROS1 rosbag::Bag/View → rosbag2_cpp::Reader; dropped
-    // subscribers + debug-image publisher. Time window derived from the first
-    // message's recv_timestamp (robust vs metadata clock-epoch mismatch).
+    // subscribers. The replay window is relative to metadata.starting_time,
+    // i.e. the beginning of the entire bag, before applying the topic filter.
     std::shared_ptr<rosbag2_cpp::Reader> reader_;
     double bag_start_s_ = 0.0;   // play window start (s, relative to bag begin)
     double bag_durr_s_ = -1.0;   // play window duration (s, <0 ⇒ to bag end)
-    int64_t bag_first_ns_ = -1;  // recv_timestamp of first read message
+    int64_t bag_first_ns_ = -1;  // metadata start of the complete, unfiltered bag
+    std::unordered_map<std::string, std::string> topic_types_;
 
     LivoxFeatureExtraction::Ptr livox_feature_extraction_;
     VelodyneFeatureExtraction::Ptr velodyne_feature_extraction_;

@@ -74,6 +74,7 @@ target_link_libraries(continuous_time_sliding_window
   Eigen3::Eigen
 )
 
+if(BUILD_TESTING)
 add_executable(trajectory_manager_probe
   test/trajectory_manager_probe.cpp
 )
@@ -427,6 +428,13 @@ add_executable(continuous_time_photometric_jacobian_probe
 target_include_directories(continuous_time_photometric_jacobian_probe PRIVATE include)
 target_link_libraries(continuous_time_photometric_jacobian_probe Eigen3::Eigen)
 
+add_executable(pointcloud2_access_probe
+  test/pointcloud2_access_probe.cpp
+)
+target_include_directories(pointcloud2_access_probe PRIVATE include)
+ament_target_dependencies(pointcloud2_access_probe sensor_msgs)
+endif()
+
 add_executable(tracking_node
   src/tracking_node.cpp
 )
@@ -463,9 +471,19 @@ ament_target_dependencies(continuous_time_node
   sensor_msgs
 )
 
-install(TARGETS trajectory_manager continuous_time_trajectory_estimator spline_marginalization continuous_time_sliding_window trajectory_manager_probe gaussian_snapshot_probe imu_propagator_probe imu_preintegrator_probe lidar_factor_probe lidar_deskew_probe sliding_window_optimizer_probe sliding_window_bias_probe sliding_window_bias_observability_probe sliding_window_gravity_estimation_probe sliding_window_imu_bias_jacobian_probe sliding_window_imu_kinematic_jacobian_probe sliding_window_marginalization_probe sliding_window_dense_prior_probe schur_complement_probe sliding_window_normal_equation_probe sliding_window_schur_marginalization_probe sliding_window_point_factor_probe sliding_window_plane_factor_probe sliding_window_geometric_jacobian_probe sliding_window_prior_jacobian_probe sliding_window_visual_factor_probe sliding_window_se3_photometric_factor_probe sliding_window_smoothness_factor_probe visual_factor_probe visual_se3_jacobian_probe ceres_spline_helper_probe continuous_time_imu_factor_probe continuous_time_lidar_factor_probe continuous_time_photometric_factor_probe continuous_time_integration_probe trajectory_estimator_probe spline_marginalization_probe continuous_time_sliding_window_probe analytic_jacobians_probe lidar_plane_extractor_probe lidar_loam_submap_probe so3_right_jacobian_probe so3_knot_jacobian_probe continuous_time_photometric_jacobian_probe tracking_node continuous_time_node
+install(TARGETS
+  trajectory_manager
+  continuous_time_trajectory_estimator
+  spline_marginalization
+  continuous_time_sliding_window
+  EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+  INCLUDES DESTINATION include
+)
+
+install(TARGETS tracking_node continuous_time_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -511,10 +529,21 @@ if(BUILD_TESTING)
   add_test(NAME so3_right_jacobian_probe COMMAND $<TARGET_FILE:so3_right_jacobian_probe>)
   add_test(NAME so3_knot_jacobian_probe COMMAND $<TARGET_FILE:so3_knot_jacobian_probe>)
   add_test(NAME continuous_time_photometric_jacobian_probe COMMAND $<TARGET_FILE:continuous_time_photometric_jacobian_probe>)
+  add_test(NAME pointcloud2_access_probe COMMAND $<TARGET_FILE:pointcloud2_access_probe>)
 endif()
 
 install(DIRECTORY include/
   DESTINATION include
 )
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(
+  builtin_interfaces
+  Ceres
+  Eigen3
+  gaussian_lic_msgs
+  sensor_msgs
+)
+ament_export_include_directories(include)
 
 ament_package()

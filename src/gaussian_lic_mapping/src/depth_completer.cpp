@@ -48,6 +48,13 @@ std::string dims_to_string(const nvinfer1::Dims & dims)
   return out.str();
 }
 
+void throw_on_cuda_error(const cudaError_t status, const std::string & operation)
+{
+  if (status != cudaSuccess) {
+    throw std::runtime_error(operation + ": " + cudaGetErrorString(status));
+  }
+}
+
 }  // namespace
 
 DepthCompleter::DepthCompleter(
@@ -65,14 +72,36 @@ DepthCompleter::DepthCompleter(
 
 DepthCompleter::~DepthCompleter()
 {
+  release_resources();
+}
+
+void DepthCompleter::release_resources() noexcept
+{
+  if (stream_ != nullptr) {
+    // All normal calls synchronize before returning. This also drains any work
+    // left behind by an exception before destroying its context and buffers.
+    (void)cudaStreamSynchronize(stream_);
+  }
   context_.reset();
-  engine_.reset();
-  runtime_.reset();
   for (void * buffer : device_buffers_) {
     if (buffer != nullptr) {
-      cudaFree(buffer);
+      (void)cudaFree(buffer);
     }
   }
+  for (float * buffer : host_buffers_) {
+    if (buffer != nullptr) {
+      (void)cudaFreeHost(buffer);
+    }
+  }
+  device_buffers_.clear();
+  host_buffers_.clear();
+  buffer_element_counts_.clear();
+  if (stream_ != nullptr) {
+    (void)cudaStreamDestroy(stream_);
+    stream_ = nullptr;
+  }
+  engine_.reset();
+  runtime_.reset();
 }
 
 void DepthCompleter::Logger::log(nvinfer1::ILogger::Severity severity, const char * msg) noexcept
@@ -101,32 +130,49 @@ cv::Mat DepthCompleter::complete(const cv::Mat & rgb_image, const cv::Mat & spar
     rgb_image.convertTo(rgb_float, CV_32FC3, 1.0 / 255.0);
   }
 
-  cv::Mat depth_float;
-  sparse_depth_m.convertTo(depth_float, CV_32F, 1.0F / 200.0F);
-  prepare_inputs(rgb_float, depth_float);
+  try {
+    cv::Mat depth_float;
+    sparse_depth_m.convertTo(depth_float, CV_32F, 1.0F / 200.0F);
+    prepare_inputs(rgb_float, depth_float);
 
-  if (!run_inference()) {
-    throw std::runtime_error("TensorRT depth completion inference failed");
+    if (!run_inference()) {
+      throw std::runtime_error("TensorRT depth completion inference failed");
+    }
+    return process_output();
+  } catch (...) {
+    // Keep the object destructible and prevent queued copies from outliving
+    // their staging buffers when inference or a subsequent CUDA call fails.
+    if (stream_ != nullptr) {
+      (void)cudaStreamSynchronize(stream_);
+    }
+    throw;
   }
-  return process_output();
 }
 
 void DepthCompleter::init_engine(const std::string & engine_path)
 {
-  const auto engine_data = read_file(engine_path);
-  runtime_.reset(nvinfer1::createInferRuntime(logger_));
-  if (!runtime_) {
-    throw std::runtime_error("failed to create TensorRT runtime");
+  try {
+    const auto engine_data = read_file(engine_path);
+    runtime_.reset(nvinfer1::createInferRuntime(logger_));
+    if (!runtime_) {
+      throw std::runtime_error("failed to create TensorRT runtime");
+    }
+    engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
+    if (!engine_) {
+      throw std::runtime_error("failed to deserialize TensorRT depth completion engine: " + engine_path);
+    }
+    context_.reset(engine_->createExecutionContext());
+    if (!context_) {
+      throw std::runtime_error("failed to create TensorRT depth completion execution context");
+    }
+    throw_on_cuda_error(
+      cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+      "failed to create CUDA stream for TensorRT depth completion");
+    allocate_buffers();
+  } catch (...) {
+    release_resources();
+    throw;
   }
-  engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
-  if (!engine_) {
-    throw std::runtime_error("failed to deserialize TensorRT depth completion engine: " + engine_path);
-  }
-  context_.reset(engine_->createExecutionContext());
-  if (!context_) {
-    throw std::runtime_error("failed to create TensorRT depth completion execution context");
-  }
-  allocate_buffers();
 }
 
 std::vector<char> DepthCompleter::read_file(const std::string & filename) const
@@ -158,7 +204,8 @@ void DepthCompleter::allocate_buffers()
     throw std::runtime_error("TensorRT depth completion engine must expose RGB, depth, mask, and output bindings");
   }
   device_buffers_.assign(static_cast<size_t>(binding_count), nullptr);
-  host_buffers_.resize(static_cast<size_t>(binding_count));
+  host_buffers_.assign(static_cast<size_t>(binding_count), nullptr);
+  buffer_element_counts_.assign(static_cast<size_t>(binding_count), 0U);
   tensor_names_.clear();
   input_indices_.clear();
   rgb_index_ = -1;
@@ -205,10 +252,15 @@ void DepthCompleter::allocate_buffers()
     if (element_count == 0U) {
       throw std::runtime_error("TensorRT tensor has an empty shape: " + dims_to_string(dims));
     }
-    host_buffers_[static_cast<size_t>(i)].resize(element_count);
-    if (cudaMalloc(&device_buffers_[static_cast<size_t>(i)], element_count * sizeof(float)) != cudaSuccess) {
-      throw std::runtime_error("CUDA memory allocation failed for TensorRT depth completion");
-    }
+    const size_t buffer_index = static_cast<size_t>(i);
+    const size_t buffer_size = element_count * sizeof(float);
+    buffer_element_counts_[buffer_index] = element_count;
+    throw_on_cuda_error(
+      cudaMallocHost(reinterpret_cast<void **>(&host_buffers_[buffer_index]), buffer_size),
+      "CUDA pinned-host allocation failed for TensorRT depth completion");
+    throw_on_cuda_error(
+      cudaMalloc(&device_buffers_[buffer_index], buffer_size),
+      "CUDA device allocation failed for TensorRT depth completion");
 #if NV_TENSORRT_MAJOR >= 10
     if (!context_->setTensorAddress(tensor_name, device_buffers_[static_cast<size_t>(i)])) {
       throw std::runtime_error("failed to bind TensorRT tensor address for " + tensor_names_[static_cast<size_t>(i)]);
@@ -250,10 +302,9 @@ bool DepthCompleter::run_inference()
       return false;
     }
   }
-  cudaStream_t stream = nullptr;
-  return context_->enqueueV3(stream);
+  return context_->enqueueV3(stream_);
 #else
-  return context_->executeV2(device_buffers_.data());
+  return context_->enqueueV2(device_buffers_.data(), stream_, nullptr);
 #endif
 }
 
@@ -276,43 +327,47 @@ void DepthCompleter::prepare_inputs(const cv::Mat & rgb_image, const cv::Mat & s
   const size_t plane_size = static_cast<size_t>(input_height_) * static_cast<size_t>(input_width_);
   for (int channel = 0; channel < 3; ++channel) {
     std::memcpy(
-      host_buffers_[static_cast<size_t>(rgb_index_)].data() + static_cast<size_t>(channel) * plane_size,
+      host_buffers_[static_cast<size_t>(rgb_index_)] + static_cast<size_t>(channel) * plane_size,
       rgb_channels[static_cast<size_t>(channel)].data,
       plane_size * sizeof(float));
   }
 
-  std::memcpy(host_buffers_[static_cast<size_t>(depth_index_)].data(), sparse_depth_m.data, plane_size * sizeof(float));
+  std::memcpy(host_buffers_[static_cast<size_t>(depth_index_)], sparse_depth_m.data, plane_size * sizeof(float));
 
   cv::Mat mask = sparse_depth_m > 0.0F;
   mask.convertTo(mask, CV_32F, 1.0 / 255.0);
-  std::memcpy(host_buffers_[static_cast<size_t>(mask_index_)].data(), mask.data, plane_size * sizeof(float));
+  std::memcpy(host_buffers_[static_cast<size_t>(mask_index_)], mask.data, plane_size * sizeof(float));
 
   for (const int input_index : input_indices_) {
     const size_t i = static_cast<size_t>(input_index);
-    if (cudaMemcpy(
+    throw_on_cuda_error(
+      cudaMemcpyAsync(
         device_buffers_[i],
-        host_buffers_[i].data(),
-        host_buffers_[i].size() * sizeof(float),
-        cudaMemcpyHostToDevice) != cudaSuccess)
-    {
-      throw std::runtime_error("CUDA H2D copy failed for TensorRT depth completion");
-    }
+        host_buffers_[i],
+        buffer_element_counts_[i] * sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream_),
+      "CUDA asynchronous H2D copy failed for TensorRT depth completion");
   }
 }
 
 cv::Mat DepthCompleter::process_output()
 {
-  auto & output = host_buffers_[static_cast<size_t>(output_index_)];
-  if (cudaMemcpy(
-      output.data(),
-      device_buffers_[static_cast<size_t>(output_index_)],
-      output.size() * sizeof(float),
-      cudaMemcpyDeviceToHost) != cudaSuccess)
-  {
-    throw std::runtime_error("CUDA D2H copy failed for TensorRT depth completion");
-  }
+  const size_t output_index = static_cast<size_t>(output_index_);
+  float * const output = host_buffers_[output_index];
+  throw_on_cuda_error(
+    cudaMemcpyAsync(
+      output,
+      device_buffers_[output_index],
+      buffer_element_counts_[output_index] * sizeof(float),
+      cudaMemcpyDeviceToHost,
+      stream_),
+    "CUDA asynchronous D2H copy failed for TensorRT depth completion");
+  throw_on_cuda_error(
+    cudaStreamSynchronize(stream_),
+    "CUDA stream synchronization failed for TensorRT depth completion");
 
-  cv::Mat result(input_height_, input_width_, CV_32F, output.data());
+  cv::Mat result(input_height_, input_width_, CV_32F, output);
   return result.clone() * 200.0F;
 }
 

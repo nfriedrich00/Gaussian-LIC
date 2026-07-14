@@ -17,14 +17,16 @@
 int main(int argc, char ** argv)
 {
   const bool explicit_bag = argc > 1;
-  const std::string bag = explicit_bag
-    ? argv[1]
-    : (std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG")
-      ? std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG")
-      : "/home/frank/data/fast_livo/CBD_Building_01_frontend_raw");
+  const char * env_bag = std::getenv("COCOLIC_TEST_FASTLIVO2_RAW_BAG");
+  const std::string bag = explicit_bag ? argv[1] : (env_bag ? env_bag : "");
+  if (bag.empty()) {
+    std::printf(
+      "[bag_ingest_test] SKIP: set COCOLIC_TEST_FASTLIVO2_RAW_BAG or pass a bag path\n");
+    return 77;
+  }
   if (!std::filesystem::exists(bag)) {
     std::printf("[bag_ingest_test] SKIP: bag path is unavailable: %s\n", bag.c_str());
-    return explicit_bag ? 1 : 0;
+    return explicit_bag ? 1 : 77;
   }
 
   rosbag2_cpp::Reader reader;

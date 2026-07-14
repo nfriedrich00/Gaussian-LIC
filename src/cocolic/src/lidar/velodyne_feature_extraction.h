@@ -30,6 +30,8 @@
 
 // #include <livox_ros_driver/CustomMsg.h>
 #include <cmath>
+#include <rclcpp/rclcpp.hpp>
+#include <cocolic/msg/feature_cloud.hpp>
 
 namespace cocolic
 {
@@ -54,11 +56,12 @@ namespace cocolic
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     typedef std::shared_ptr<VelodyneFeatureExtraction> Ptr;
 
-    VelodyneFeatureExtraction(const YAML::Node &node);
+    VelodyneFeatureExtraction(const YAML::Node &node,
+                              const rclcpp::Node::SharedPtr &ros_node = nullptr);
 
     void LidarHandler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &lidar_msg);
 
-    void LidarHandler(const RTPointCloud::Ptr raw_cloud);
+    void LidarHandler(const RTPointCloud::Ptr raw_cloud, int64_t stamp_ns = -1);
 
     //
     bool ParsePointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &lidar_msg,
@@ -101,10 +104,15 @@ namespace cocolic
     void ExtractFeatures();
 
     //
-    void PublishCloud(std::string frame_id);
+    void PublishCloud(int64_t stamp_ns);
 
   private:
-    // ROS2 port: dropped ros::NodeHandle + debug-viz publishers/subscriber.
+    rclcpp::Node::SharedPtr ros_node_;
+    std::string debug_frame_ = "lidar";
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_corner_cloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_surface_cloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_full_cloud_;
+    rclcpp::Publisher<cocolic::msg::FeatureCloud>::SharedPtr pub_feature_cloud_;
 
     LiDARFeatureParam fea_param_;
 
@@ -122,9 +130,9 @@ namespace cocolic
     std::vector<int> end_ring_index;
 
     std::vector<smoothness_t> cloud_smoothness;
-    float *cloud_curvature;
-    int *cloud_neighbor_picked;
-    int *cloud_label;
+    std::vector<float> cloud_curvature;
+    std::vector<int> cloud_neighbor_picked;
+    std::vector<int> cloud_label;
 
     ///
     RTPointCloud::Ptr p_corner_cloud;

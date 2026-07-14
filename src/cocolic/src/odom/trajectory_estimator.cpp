@@ -25,6 +25,8 @@
 #include <utils/ceres_callbacks.h>
 
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <variant>
@@ -306,7 +308,7 @@ namespace cocolic
     AddControlPointsNURBS(su.first - 3, vec);
     AddControlPointsNURBS(su.first - 3, vec, true);
 
-    // GL2 step-2c: robust kernel on the render-photometric residual — render
+    // Render-photometric: robust kernel on the render-photometric residual — render
     // outliers (occlusions, imperfect renders, dynamic content) inject large
     // intensity residuals that otherwise destabilize the SO(3) control points
     // (non-orthogonal-R Sophus crash at higher weights). Cauchy bounds them.
@@ -683,17 +685,18 @@ namespace cocolic
     }
   }
 
-  void TrajectoryEstimator::PrepareMarginalizationInfo(
+  bool TrajectoryEstimator::PrepareMarginalizationInfo(
       ResidualType r_type, ceres::CostFunction *cost_function,
       ceres::LossFunction *loss_function, std::vector<double *> &parameter_blocks,
       std::vector<int> &drop_set)
   {
     ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
-        r_type, cost_function, NULL, parameter_blocks, drop_set);
+        r_type, cost_function, loss_function, parameter_blocks, drop_set);
     marginalization_info_->addResidualBlockInfo(residual_block_info);
+    return true;
   }
 
-  void TrajectoryEstimator::PrepareMarginalizationInfo(
+  bool TrajectoryEstimator::PrepareMarginalizationInfo(
       ResidualType r_type, const SplineMeta<SplineOrder> &spline_meta,
       ceres::CostFunction *cost_function, ceres::LossFunction *loss_function,
       std::vector<double *> &parameter_blocks,
@@ -720,10 +723,12 @@ namespace cocolic
       ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
           r_type, cost_function, loss_function, parameter_blocks, drop_set);
       marginalization_info_->addResidualBlockInfo(residual_block_info);
+      return true;
     }
+    return false;
   }
 
-  void TrajectoryEstimator::PrepareMarginalizationInfo(
+  bool TrajectoryEstimator::PrepareMarginalizationInfo(
       ResidualType r_type,
       ceres::CostFunction *cost_function, ceres::LossFunction *loss_function,
       std::vector<double *> &parameter_blocks,
@@ -736,11 +741,13 @@ namespace cocolic
       ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
           r_type, cost_function, loss_function, parameter_blocks, drop_set);
       marginalization_info_->addResidualBlockInfo(residual_block_info);
+      return true;
     }
     else
     {
 
     }
+    return false;
   }
 
   void TrajectoryEstimator::SaveMarginalizationInfo(
@@ -980,6 +987,7 @@ namespace cocolic
     // loss_function = new ceres::HuberLoss(1.0); // marg factor
     loss_function = new ceres::CauchyLoss(cauchy_loss); // adopt from vins-mono
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_factor)
     {
       std::vector<int> drop_set_wo_ctrl_point;
@@ -996,12 +1004,21 @@ namespace cocolic
       }
       if (options.marg_t_offset_param)
         drop_set_wo_ctrl_point.emplace_back(Knot_size + 3); // t_offset
-      PrepareMarginalizationInfo(RType_IMU, spline_meta, cost_function,
-                                 loss_function, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_IMU, spline_meta, cost_function, loss_function, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, loss_function, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      delete loss_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1162,6 +1179,9 @@ namespace cocolic
     int64_t time_ns;
     if (!MeasuredTimeToNs(LiDARSensor, pc.t_point, time_ns))
       return;
+    if (!std::isfinite(weight) || std::fabs(weight) <=
+                                      std::numeric_limits<double>::epsilon())
+      return;
     SplineMeta<SplineOrder> spline_meta;
     trajectory_->CaculateSplineMeta({{time_ns, time_ns}}, spline_meta);
 
@@ -1174,24 +1194,34 @@ namespace cocolic
     AddControlPoints(spline_meta, vec);
     AddControlPoints(spline_meta, vec, true);
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_factor)
     {
       int num_residuals = cost_function->num_residuals();
       Eigen::MatrixXd residuals;
       residuals.setZero(num_residuals, 1);
 
-      cost_function->Evaluate(vec.data(), residuals.data(), nullptr);
+      const bool evaluated =
+          cost_function->Evaluate(vec.data(), residuals.data(), nullptr);
       double dist = (residuals / weight).norm();
-      if (dist < 0.05)
+      if (evaluated && std::isfinite(dist) && dist < 0.05)
       {
         std::vector<int> drop_set_wo_ctrl_point;
-        PrepareMarginalizationInfo(RType_LiDAR, spline_meta, cost_function, NULL,
-                                   vec, drop_set_wo_ctrl_point);
+        residual_owned = PrepareMarginalizationInfo(
+            RType_LiDAR, spline_meta, cost_function, NULL, vec,
+            drop_set_wo_ctrl_point);
       }
     }
     else
     {
       problem_->AddResidualBlock(cost_function, NULL, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1223,15 +1253,24 @@ namespace cocolic
     AddControlPoints(spline_meta, vec);
     AddControlPoints(spline_meta, vec, true);
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_factor)
     {
       std::vector<int> drop_set_wo_ctrl_point;
-      PrepareMarginalizationInfo(RType_LiDAR_Relative, spline_meta, cost_function,
-                                 NULL, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_LiDAR_Relative, spline_meta, cost_function, NULL, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, NULL, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1264,17 +1303,26 @@ namespace cocolic
     problem_->AddParameterBlock(S_ImtoG, 4, analytic_local_parameterization_);
     // problem_->SetParameterBlockConstant(S_ImtoG);
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_factor)
     {
       std::vector<int> drop_set_wo_ctrl_point;
       drop_set_wo_ctrl_point.emplace_back(vec.size() - 2); // map rotation
       drop_set_wo_ctrl_point.emplace_back(vec.size() - 1); // map position
-      PrepareMarginalizationInfo(RType_LiDAROpt, spline_meta, cost_function, NULL,
-                                 vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_LiDAROpt, spline_meta, cost_function, NULL, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, NULL, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1353,6 +1401,7 @@ namespace cocolic
     // loss_function = new ceres::HuberLoss(1.0); // marg factor
     loss_function = new ceres::CauchyLoss(cauchy_loss); // adopt from vins-mono
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_fearure)
     {
       std::vector<int> drop_set_wo_ctrl_point;
@@ -1361,12 +1410,21 @@ namespace cocolic
       drop_set_wo_ctrl_point.emplace_back(Knot_size);
       if (options.marg_t_offset_param)
         drop_set_wo_ctrl_point.emplace_back(Knot_size + 1); // t_offset
-      PrepareMarginalizationInfo(RType_Image, spline_meta, cost_function,
-                                 loss_function, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_Image, spline_meta, cost_function, loss_function, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, loss_function, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      delete loss_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1432,6 +1490,7 @@ namespace cocolic
     // loss_function = new ceres::HuberLoss(1.0); // marg factor
     loss_function = new ceres::CauchyLoss(1.0); // adopt from vins-mono
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_fearure)
     {
       std::vector<int> drop_set_wo_ctrl_point;
@@ -1440,12 +1499,21 @@ namespace cocolic
       drop_set_wo_ctrl_point.emplace_back(Knot_size);
       if (options.marg_t_offset_param)
         drop_set_wo_ctrl_point.emplace_back(Knot_size + 1); // t_offset
-      PrepareMarginalizationInfo(RType_Image, spline_meta, cost_function,
-                                 loss_function, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_Image, spline_meta, cost_function, loss_function, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, loss_function, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      delete loss_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1485,17 +1553,27 @@ namespace cocolic
     ceres::LossFunction *loss_function;
     loss_function = new ceres::CauchyLoss(1.0); // adopt from vins-mono
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_fearure)
     {
       std::vector<int> drop_set_wo_ctrl_point;
       // inverse depth position
       drop_set_wo_ctrl_point.emplace_back(vec.size() - 1);
-      PrepareMarginalizationInfo(RType_Image, spline_meta, cost_function,
-                                 loss_function, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_Image, spline_meta, cost_function, loss_function, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, loss_function, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      delete loss_function;
+      return;
     }
 
     if (options.show_residual_summary)
@@ -1552,15 +1630,25 @@ namespace cocolic
     // loss_function = new ceres::HuberLoss(1.0); // marg factor
     loss_function = new ceres::CauchyLoss(1.0); // adopt from vins-mono
 
+    bool residual_owned = false;
     if (options.is_marg_state && marg_this_fearure)
     {
       std::vector<int> drop_set_wo_ctrl_point;
-      PrepareMarginalizationInfo(RType_Epipolar, spline_meta, cost_function,
-                                 loss_function, vec, drop_set_wo_ctrl_point);
+      residual_owned = PrepareMarginalizationInfo(
+          RType_Epipolar, spline_meta, cost_function, loss_function, vec,
+          drop_set_wo_ctrl_point);
     }
     else
     {
       problem_->AddResidualBlock(cost_function, loss_function, vec);
+      residual_owned = true;
+    }
+
+    if (!residual_owned)
+    {
+      delete cost_function;
+      delete loss_function;
+      return;
     }
 
     if (options.show_residual_summary)

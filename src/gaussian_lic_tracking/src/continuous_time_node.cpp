@@ -42,12 +42,12 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include <gaussian_lic_msgs/msg/gaussian_array.hpp>
 #include <gaussian_lic_msgs/msg/rendered_feedback.hpp>
 #include <gaussian_lic_tracking/gaussian_snapshot.hpp>
 #include <gaussian_lic_tracking/lidar_factor.hpp>
+#include <gaussian_lic_tracking/pointcloud2_access.hpp>
 #include <gaussian_lic_tracking/time.hpp>
 #include <gaussian_lic_tracking/visual_factor.hpp>
 #include <gaussian_lic_tracking/spline/continuous_time_sliding_window.hpp>
@@ -92,128 +92,145 @@ const sensor_msgs::msg::PointField * find_point_time_field(
   return nullptr;
 }
 
-size_t point_field_scalar_size(const sensor_msgs::msg::PointField & field)
+struct PointCloudReadView
 {
-  switch (field.datatype) {
-    case sensor_msgs::msg::PointField::INT8:
-    case sensor_msgs::msg::PointField::UINT8:
-      return 1U;
-    case sensor_msgs::msg::PointField::INT16:
-    case sensor_msgs::msg::PointField::UINT16:
-      return 2U;
-    case sensor_msgs::msg::PointField::INT32:
-    case sensor_msgs::msg::PointField::UINT32:
-    case sensor_msgs::msg::PointField::FLOAT32:
-      return 4U;
-    case sensor_msgs::msg::PointField::FLOAT64:
-      return 8U;
-    default:
-      return 0U;
+  gaussian_lic_tracking::pointcloud2::Layout layout;
+  const sensor_msgs::msg::PointField * x{nullptr};
+  const sensor_msgs::msg::PointField * y{nullptr};
+  const sensor_msgs::msg::PointField * z{nullptr};
+  const sensor_msgs::msg::PointField * time{nullptr};
+};
+
+bool prepare_pointcloud_read_view(
+  const sensor_msgs::msg::PointCloud2 & msg,
+  PointCloudReadView & view,
+  std::string & error)
+{
+  view = PointCloudReadView{};
+  if (!gaussian_lic_tracking::pointcloud2::validate_layout(msg, view.layout, &error)) {
+    return false;
   }
+  if (view.layout.point_count == 0U) {
+    return true;
+  }
+  view.x = find_pointcloud_field(msg, "x");
+  view.y = find_pointcloud_field(msg, "y");
+  view.z = find_pointcloud_field(msg, "z");
+  view.time = find_point_time_field(msg);
+  if (view.x == nullptr || view.y == nullptr || view.z == nullptr) {
+    error = "numeric scalar x/y/z fields are required";
+    return false;
+  }
+  for (const auto * field : {view.x, view.y, view.z, view.time}) {
+    if (field != nullptr &&
+      !gaussian_lic_tracking::pointcloud2::validate_scalar_field(
+        *field, view.layout, &error))
+    {
+      error = "field '" + field->name + "': " + error;
+      return false;
+    }
+  }
+  return true;
 }
 
-bool read_point_numeric_field(
-  const uint8_t * base,
-  const sensor_msgs::msg::PointField & field,
-  double & value)
+bool read_xyz(
+  const sensor_msgs::msg::PointCloud2 & msg,
+  const PointCloudReadView & view,
+  const std::size_t point_index,
+  Eigen::Vector3d & point)
 {
-  switch (field.datatype) {
-    case sensor_msgs::msg::PointField::INT8: {
-        int8_t raw = 0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::UINT8: {
-        uint8_t raw = 0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::INT16: {
-        int16_t raw = 0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::UINT16: {
-        uint16_t raw = 0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::INT32: {
-        int32_t raw = 0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::UINT32: {
-        uint32_t raw = 0U;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::FLOAT32: {
-        float raw = 0.0F;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = static_cast<double>(raw);
-        return true;
-      }
-    case sensor_msgs::msg::PointField::FLOAT64: {
-        double raw = 0.0;
-        std::memcpy(&raw, base + field.offset, sizeof(raw));
-        value = raw;
-        return true;
-      }
-    default:
-      return false;
+  if (view.x == nullptr || view.y == nullptr || view.z == nullptr) {
+    return false;
   }
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+  if (!gaussian_lic_tracking::pointcloud2::read_numeric(
+      msg, view.layout, point_index, *view.x, x) ||
+    !gaussian_lic_tracking::pointcloud2::read_numeric(
+      msg, view.layout, point_index, *view.y, y) ||
+    !gaussian_lic_tracking::pointcloud2::read_numeric(
+      msg, view.layout, point_index, *view.z, z))
+  {
+    return false;
+  }
+  point = Eigen::Vector3d{x, y, z};
+  return point.allFinite();
+}
+
+std::optional<int64_t> scaled_nanoseconds(const double value, const double scale)
+{
+  const long double scaled =
+    static_cast<long double>(value) * static_cast<long double>(scale);
+  if (!std::isfinite(scaled)) {
+    return std::nullopt;
+  }
+  const long double rounded = std::round(scaled);
+  if (rounded < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
+    rounded > static_cast<long double>(std::numeric_limits<int64_t>::max()))
+  {
+    return std::nullopt;
+  }
+  return static_cast<int64_t>(rounded);
+}
+
+std::optional<int64_t> add_nanoseconds(const int64_t stamp_ns, const int64_t offset_ns)
+{
+  if ((offset_ns > 0 && stamp_ns > std::numeric_limits<int64_t>::max() - offset_ns) ||
+    (offset_ns < 0 && stamp_ns < std::numeric_limits<int64_t>::min() - offset_ns))
+  {
+    return std::nullopt;
+  }
+  return stamp_ns + offset_ns;
+}
+
+double absolute_stamp_delta_seconds(const int64_t lhs, const int64_t rhs)
+{
+  return static_cast<double>(
+    std::abs(static_cast<long double>(lhs) - static_cast<long double>(rhs)) * 1.0e-9L);
 }
 
 std::optional<int64_t> decode_point_stamp_ns(
   const sensor_msgs::msg::PointCloud2 & msg,
+  const gaussian_lic_tracking::pointcloud2::Layout & layout,
   const sensor_msgs::msg::PointField * time_field,
   const size_t point_index,
   const int64_t cloud_stamp_ns)
 {
-  const size_t point_count = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
-  if (time_field == nullptr || msg.point_step == 0U || point_index >= point_count) {
-    return std::nullopt;
-  }
-  const size_t scalar_size = point_field_scalar_size(*time_field);
-  const size_t base = point_index * static_cast<size_t>(msg.point_step);
-  if (scalar_size == 0U || base + time_field->offset + scalar_size > msg.data.size()) {
+  if (time_field == nullptr || point_index >= layout.point_count ||
+    !gaussian_lic_tracking::pointcloud2::validate_scalar_field(*time_field, layout))
+  {
     return std::nullopt;
   }
   double raw_time = 0.0;
-  if (!read_point_numeric_field(msg.data.data() + base, *time_field, raw_time) ||
+  if (!gaussian_lic_tracking::pointcloud2::read_numeric(
+      msg, layout, point_index, *time_field, raw_time) ||
     !std::isfinite(raw_time))
   {
     return std::nullopt;
   }
 
-  auto scale_to_ns = [](const double value, const double scale) {
-      return static_cast<int64_t>(std::llround(value * scale));
-    };
   bool offset_mode = true;
-  int64_t time_ns = 0;
+  std::optional<int64_t> time_ns;
   const double abs_time = std::abs(raw_time);
   if (time_field->name == "offset_time") {
-    time_ns = static_cast<int64_t>(std::llround(raw_time));
+    time_ns = scaled_nanoseconds(raw_time, 1.0);
   } else if (abs_time > 1.0e17) {
-    time_ns = static_cast<int64_t>(std::llround(raw_time));
+    time_ns = scaled_nanoseconds(raw_time, 1.0);
     offset_mode = false;
   } else if (abs_time > 1.0e14) {
-    time_ns = scale_to_ns(raw_time, 1.0e3);
+    time_ns = scaled_nanoseconds(raw_time, 1.0e3);
     offset_mode = false;
   } else if ((time_field->name == "timestamp" || time_field->name == "t") && abs_time > 1.0e8) {
-    time_ns = scale_to_ns(raw_time, 1.0e9);
+    time_ns = scaled_nanoseconds(raw_time, 1.0e9);
     offset_mode = false;
   } else {
-    time_ns = scale_to_ns(raw_time, 1.0e9);
+    time_ns = scaled_nanoseconds(raw_time, 1.0e9);
   }
-  return offset_mode ? cloud_stamp_ns + time_ns : time_ns;
+  if (!time_ns.has_value()) {
+    return std::nullopt;
+  }
+  return offset_mode ? add_nanoseconds(cloud_stamp_ns, time_ns.value()) : time_ns;
 }
 
 int64_t nearest_point_stamp_ns(
@@ -242,19 +259,25 @@ int64_t pointcloud_required_pose_stamp_ns(
   const int64_t cloud_stamp_ns,
   const double max_abs_point_time_offset_s)
 {
+  gaussian_lic_tracking::pointcloud2::Layout layout;
+  if (!gaussian_lic_tracking::pointcloud2::validate_layout(msg, layout)) {
+    return cloud_stamp_ns;
+  }
   const auto * time_field = find_point_time_field(msg);
-  if (time_field == nullptr) {
+  if (time_field == nullptr ||
+    !gaussian_lic_tracking::pointcloud2::validate_scalar_field(*time_field, layout))
+  {
     return cloud_stamp_ns;
   }
   int64_t required_stamp_ns = cloud_stamp_ns;
-  const size_t point_count = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
-  for (size_t point_index = 0U; point_index < point_count; ++point_index) {
-    const auto decoded_stamp = decode_point_stamp_ns(msg, time_field, point_index, cloud_stamp_ns);
+  for (size_t point_index = 0U; point_index < layout.point_count; ++point_index) {
+    const auto decoded_stamp =
+      decode_point_stamp_ns(msg, layout, time_field, point_index, cloud_stamp_ns);
     if (!decoded_stamp.has_value()) {
       continue;
     }
-    const double abs_offset_s =
-      std::abs(static_cast<double>(decoded_stamp.value() - cloud_stamp_ns) * 1.0e-9);
+    const double abs_offset_s = absolute_stamp_delta_seconds(
+      decoded_stamp.value(), cloud_stamp_ns);
     if (abs_offset_s <= max_abs_point_time_offset_s) {
       required_stamp_ns = std::max(required_stamp_ns, decoded_stamp.value());
     }
@@ -386,30 +409,47 @@ public:
     // into the prior's pose before it becomes the seed orientation.
     const auto prior_to_imu_param = declare_parameter<std::vector<double>>(
       "prior_to_imu_rotation_xyzw", std::vector<double>{0.0, 0.0, 0.0, 1.0});
-    if (prior_to_imu_param.size() == 4) {
-      prior_to_imu_rotation_ = Eigen::Quaterniond(
-        prior_to_imu_param[3],
-        prior_to_imu_param[0],
-        prior_to_imu_param[1],
-        prior_to_imu_param[2]).normalized();
+    if (prior_to_imu_param.size() != 4U ||
+      !std::all_of(prior_to_imu_param.begin(), prior_to_imu_param.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error(
+              "prior_to_imu_rotation_xyzw must contain four finite values");
     }
+    prior_to_imu_rotation_ = Eigen::Quaterniond(
+      prior_to_imu_param[3], prior_to_imu_param[0],
+      prior_to_imu_param[1], prior_to_imu_param[2]);
+    if (prior_to_imu_rotation_.norm() <= 1.0e-9) {
+      throw std::runtime_error("prior_to_imu_rotation_xyzw must have non-zero norm");
+    }
+    prior_to_imu_rotation_.normalize();
     const auto camera_to_imu_param = declare_parameter<std::vector<double>>(
       "camera_to_imu_rotation_xyzw", std::vector<double>{0.0, 0.0, 0.0, 1.0});
-    if (camera_to_imu_param.size() == 4) {
-      camera_to_imu_rotation_ = Eigen::Quaterniond(
-        camera_to_imu_param[3],
-        camera_to_imu_param[0],
-        camera_to_imu_param[1],
-        camera_to_imu_param[2]).normalized();
+    if (camera_to_imu_param.size() != 4U ||
+      !std::all_of(camera_to_imu_param.begin(), camera_to_imu_param.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error(
+              "camera_to_imu_rotation_xyzw must contain four finite values");
     }
+    camera_to_imu_rotation_ = Eigen::Quaterniond(
+      camera_to_imu_param[3], camera_to_imu_param[0],
+      camera_to_imu_param[1], camera_to_imu_param[2]);
+    if (camera_to_imu_rotation_.norm() <= 1.0e-9) {
+      throw std::runtime_error("camera_to_imu_rotation_xyzw must have non-zero norm");
+    }
+    camera_to_imu_rotation_.normalize();
     const auto camera_to_imu_translation_param = declare_parameter<std::vector<double>>(
       "camera_to_imu_translation_m", std::vector<double>{0.0, 0.0, 0.0});
-    if (camera_to_imu_translation_param.size() == 3) {
-      camera_to_imu_translation_ = Eigen::Vector3d(
-        camera_to_imu_translation_param[0],
-        camera_to_imu_translation_param[1],
-        camera_to_imu_translation_param[2]);
+    if (camera_to_imu_translation_param.size() != 3U ||
+      !std::all_of(camera_to_imu_translation_param.begin(), camera_to_imu_translation_param.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error("camera_to_imu_translation_m must contain three finite values");
     }
+    camera_to_imu_translation_ = Eigen::Vector3d(
+      camera_to_imu_translation_param[0], camera_to_imu_translation_param[1],
+      camera_to_imu_translation_param[2]);
     odometry_topic_ = declare_parameter<std::string>(
       "odometry_topic", "/gaussian_lic/continuous_time/odometry");
     path_topic_ = declare_parameter<std::string>(
@@ -420,6 +460,12 @@ public:
       declare_parameter<int>("gaussian_snapshot_qos_depth", 64));
     body_frame_id_ = declare_parameter<std::string>("body_frame_id", "imu_link");
     world_frame_id_ = declare_parameter<std::string>("world_frame_id", "map");
+    if (gaussian_snapshot_qos_depth_ < 1) {
+      throw std::runtime_error("gaussian_snapshot_qos_depth must be positive");
+    }
+    if (body_frame_id_.empty() || world_frame_id_.empty()) {
+      throw std::runtime_error("body_frame_id and world_frame_id must not be empty");
+    }
 
     spline::ContinuousTimeSlidingWindowOptions options;
     options.dt_s = declare_parameter<double>("knot_interval_seconds", 0.05);
@@ -429,6 +475,9 @@ public:
       static_cast<int>(declare_parameter<int>("marginalize_oldest_count", 1));
     options.max_iterations_per_step =
       static_cast<int>(declare_parameter<int>("max_iterations_per_step", 1));
+    if (options.max_iterations_per_step <= 0) {
+      throw std::runtime_error("max_iterations_per_step must be positive");
+    }
     options.imu_info_gyro =
       declare_parameter<double>("imu_info_gyro", 10.0);
     options.imu_info_accel =
@@ -540,14 +589,21 @@ public:
     }
     options.lidar_huber_delta_m =
       declare_parameter<double>("lidar_huber_delta_m", 0.10);
+    if (!std::isfinite(options.lidar_huber_delta_m) || options.lidar_huber_delta_m < 0.0) {
+      throw std::runtime_error("lidar_huber_delta_m must be finite and non-negative");
+    }
     lidar_huber_delta_m_ = options.lidar_huber_delta_m;
     const auto gravity_param =
       declare_parameter<std::vector<double>>(
       "gravity_world", std::vector<double>{0.0, 0.0, -9.81});
-    if (gravity_param.size() == 3) {
-      options.gravity_world =
-        Eigen::Vector3d(gravity_param[0], gravity_param[1], gravity_param[2]);
+    if (gravity_param.size() != 3U ||
+      !std::all_of(gravity_param.begin(), gravity_param.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error("gravity_world must contain three finite values");
     }
+    options.gravity_world =
+      Eigen::Vector3d(gravity_param[0], gravity_param[1], gravity_param[2]);
     options.hold_gravity_constant =
       declare_parameter<bool>("hold_gravity_constant", true);
     options.hold_accel_bias_constant =
@@ -567,11 +623,14 @@ public:
       declare_parameter<int>("update_gate_edge_knot_margin", 0);
     options.position_extrapolation_damping =
       declare_parameter<double>("position_extrapolation_damping", 0.0);
-    if (!std::isfinite(options.position_extrapolation_damping) ||
+    if (!std::isfinite(options.max_position_update_m) || options.max_position_update_m < 0.0 ||
+      !std::isfinite(options.max_rotation_update_rad) || options.max_rotation_update_rad < 0.0 ||
+      !std::isfinite(options.position_extrapolation_damping) ||
       options.position_extrapolation_damping < 0.0 ||
       options.position_extrapolation_damping > 1.0)
     {
-      throw std::runtime_error("position_extrapolation_damping must be finite in [0, 1]");
+      throw std::runtime_error(
+              "pose update limits must be finite/non-negative and damping must be in [0, 1]");
     }
     options.apply_position_update_on_rotation_reject =
       declare_parameter<bool>("apply_position_update_on_rotation_reject", false);
@@ -593,6 +652,9 @@ public:
 
     step_period_seconds_ =
       declare_parameter<double>("step_period_seconds", 0.10);
+    if (!std::isfinite(step_period_seconds_) || step_period_seconds_ <= 0.0) {
+      throw std::runtime_error("step_period_seconds must be finite and positive");
+    }
     use_stamp_driven_steps_ =
       declare_parameter<bool>("use_stamp_driven_steps", false);
     max_stamp_driven_steps_per_callback_ =
@@ -628,6 +690,9 @@ public:
       static_cast<int>(declare_parameter<int>("seed_min_imu_count", 25));
     max_path_history_ =
       static_cast<int>(declare_parameter<int>("max_path_history", 5000));
+    if (seed_min_imu_count_ < 1 || max_path_history_ < 1) {
+      throw std::runtime_error("seed_min_imu_count and max_path_history must be positive");
+    }
     enable_visual_rotation_prior_ =
       declare_parameter<bool>("enable_visual_rotation_prior", false);
     visual_rotation_prior_weight_ =
@@ -828,10 +893,8 @@ public:
     if (!output_tum_path_.empty()) {
       output_tum_stream_.open(output_tum_path_, std::ios::out | std::ios::trunc);
       if (!output_tum_stream_) {
-        RCLCPP_WARN(
-          get_logger(),
-          "could not open output_tum_path '%s' for writing",
-          output_tum_path_.c_str());
+        throw std::runtime_error(
+                "could not open output_tum_path '" + output_tum_path_ + "' for writing");
       } else {
         output_tum_stream_ << "# stamp_s tx ty tz qx qy qz qw" << std::endl;
         output_tum_stream_.flush();
@@ -848,9 +911,6 @@ public:
       static_cast<int>(declare_parameter<int>("pointcloud_max_points_per_msg", 256));
     pointcloud_wait_queue_max_size_ =
       static_cast<int>(declare_parameter<int>("pointcloud_wait_queue_max_size", 100));
-    if (pointcloud_wait_queue_max_size_ < 0) {
-      throw std::runtime_error("pointcloud_wait_queue_max_size must be >= 0");
-    }
     pointcloud_min_range_m_ =
       declare_parameter<double>("pointcloud_min_range_m", 0.3);
     pointcloud_max_range_m_ =
@@ -861,12 +921,17 @@ public:
       declare_parameter<bool>("pointcloud_use_lidar_scale", true);
     pointcloud_min_lidar_scale_ =
       declare_parameter<double>("pointcloud_min_lidar_scale", 0.1);
-    if (!std::isfinite(pointcloud_factor_weight_) || pointcloud_factor_weight_ <= 0.0 ||
+    if (pointcloud_subsample_stride_ < 1 || pointcloud_max_points_per_msg_ < 0 ||
+      pointcloud_wait_queue_max_size_ < 0 ||
+      !std::isfinite(pointcloud_min_range_m_) || pointcloud_min_range_m_ < 0.0 ||
+      !std::isfinite(pointcloud_max_range_m_) ||
+      pointcloud_max_range_m_ <= pointcloud_min_range_m_ ||
+      !std::isfinite(pointcloud_factor_weight_) || pointcloud_factor_weight_ <= 0.0 ||
       !std::isfinite(pointcloud_min_lidar_scale_) ||
       pointcloud_min_lidar_scale_ < 0.0 ||
       pointcloud_min_lidar_scale_ > 1.0)
     {
-      throw std::runtime_error("pointcloud factor weight/scale parameters are invalid");
+      throw std::runtime_error("pointcloud range/stride/queue/factor parameters are invalid");
     }
     enable_lidar_point_deskew_ =
       declare_parameter<bool>("enable_lidar_point_deskew", false);
@@ -1164,6 +1229,7 @@ public:
       !std::isfinite(persistent_point_map_factor_weight_) ||
       persistent_point_map_factor_weight_ <= 0.0 ||
       persistent_point_map_subsample_stride_ < 1 ||
+      persistent_point_map_max_points_ < 0 ||
       persistent_point_map_max_correspondences_ < 0 ||
       persistent_point_map_min_observations_for_match_ < 1)
     {
@@ -1199,14 +1265,36 @@ public:
       declare_parameter<int>("voxel_edge_max_correspondences", 128));
     extractor_options.min_range_m = pointcloud_min_range_m_;
     extractor_options.max_range_m = pointcloud_max_range_m_;
+    if (!std::isfinite(extractor_options.voxel_size_m) ||
+      extractor_options.voxel_size_m <= 0.0 ||
+      extractor_options.min_points_per_voxel < 3 ||
+      !std::isfinite(extractor_options.planar_eigenvalue_ratio) ||
+      extractor_options.planar_eigenvalue_ratio < 0.0 ||
+      !std::isfinite(extractor_options.max_inlier_distance_m) ||
+      extractor_options.max_inlier_distance_m < 0.0 ||
+      extractor_options.max_correspondences < 0 ||
+      !std::isfinite(extractor_options.linear_eigenvalue_ratio) ||
+      extractor_options.linear_eigenvalue_ratio < 0.0 ||
+      extractor_options.max_edge_correspondences < 0)
+    {
+      throw std::runtime_error("voxel plane/edge extraction parameters are invalid");
+    }
     plane_extractor_.set_options(extractor_options);
     spline::LoamSubmapOptions loam_options;
     loam_options.search_voxel_size_m =
       declare_parameter<double>("loam_submap_voxel_size_m", 0.5);
     loam_options.max_neighbor_distance_m =
       declare_parameter<double>("loam_submap_max_neighbor_m", 1.0);
-    loam_options.max_points = static_cast<std::size_t>(
-      declare_parameter<int>("loam_submap_max_points", 40000));
+    const int loam_submap_max_points =
+      declare_parameter<int>("loam_submap_max_points", 40000);
+    if (!std::isfinite(loam_options.search_voxel_size_m) ||
+      loam_options.search_voxel_size_m <= 0.0 ||
+      !std::isfinite(loam_options.max_neighbor_distance_m) ||
+      loam_options.max_neighbor_distance_m <= 0.0 || loam_submap_max_points < 0)
+    {
+      throw std::runtime_error("LOAM submap parameters are invalid");
+    }
+    loam_options.max_points = static_cast<std::size_t>(loam_submap_max_points);
     loam_submap_.set_options(loam_options);
     spline::PersistentPlaneMapOptions plane_map_options;
     plane_map_options.max_planes = static_cast<int>(
@@ -1217,35 +1305,57 @@ public:
       declare_parameter<double>("persistent_plane_map_min_normal_dot", 0.95);
     plane_map_options.min_observations_for_match = static_cast<int>(
       declare_parameter<int>("persistent_plane_map_min_observations_for_match", 3));
+    if (plane_map_options.max_planes < 0 ||
+      !std::isfinite(plane_map_options.max_point_to_plane_distance_m) ||
+      plane_map_options.max_point_to_plane_distance_m < 0.0 ||
+      !std::isfinite(plane_map_options.min_normal_dot) ||
+      plane_map_options.min_normal_dot < 0.0 || plane_map_options.min_normal_dot > 1.0 ||
+      plane_map_options.min_observations_for_match < 1)
+    {
+      throw std::runtime_error("persistent plane-map parameters are invalid");
+    }
     persistent_plane_map_.set_options(plane_map_options);
 
     const auto plane_param = declare_parameter<std::vector<double>>(
       "lidar_ground_plane", std::vector<double>{0.0, 0.0, 1.0, 0.0});
-    if (plane_param.size() == 4) {
-      lidar_plane_ << plane_param[0], plane_param[1], plane_param[2], plane_param[3];
-      const double n_norm = lidar_plane_.head<3>().norm();
-      if (n_norm > 1.0e-9) {
-        lidar_plane_ /= n_norm;
-      }
+    if (plane_param.size() != 4U ||
+      !std::all_of(plane_param.begin(), plane_param.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error("lidar_ground_plane must contain four finite values");
     }
+    lidar_plane_ << plane_param[0], plane_param[1], plane_param[2], plane_param[3];
+    const double n_norm = lidar_plane_.head<3>().norm();
+    if (n_norm <= 1.0e-9) {
+      throw std::runtime_error("lidar_ground_plane normal must have non-zero norm");
+    }
+    lidar_plane_ /= n_norm;
 
     const auto extrinsic_translation = declare_parameter<std::vector<double>>(
       "lidar_to_imu_translation", std::vector<double>{0.0, 0.0, 0.0});
-    if (extrinsic_translation.size() == 3) {
-      lidar_to_imu_translation_ = Eigen::Vector3d(
-        extrinsic_translation[0],
-        extrinsic_translation[1],
-        extrinsic_translation[2]);
+    if (extrinsic_translation.size() != 3U ||
+      !std::all_of(extrinsic_translation.begin(), extrinsic_translation.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error("lidar_to_imu_translation must contain three finite values");
     }
+    lidar_to_imu_translation_ = Eigen::Vector3d(
+      extrinsic_translation[0], extrinsic_translation[1], extrinsic_translation[2]);
     const auto extrinsic_rotation_xyzw = declare_parameter<std::vector<double>>(
       "lidar_to_imu_rotation_xyzw", std::vector<double>{0.0, 0.0, 0.0, 1.0});
-    if (extrinsic_rotation_xyzw.size() == 4) {
-      lidar_to_imu_rotation_ = Eigen::Quaterniond(
-        extrinsic_rotation_xyzw[3],
-        extrinsic_rotation_xyzw[0],
-        extrinsic_rotation_xyzw[1],
-        extrinsic_rotation_xyzw[2]).normalized();
+    if (extrinsic_rotation_xyzw.size() != 4U ||
+      !std::all_of(extrinsic_rotation_xyzw.begin(), extrinsic_rotation_xyzw.end(),
+        [](const double value) {return std::isfinite(value);}))
+    {
+      throw std::runtime_error("lidar_to_imu_rotation_xyzw must contain four finite values");
     }
+    lidar_to_imu_rotation_ = Eigen::Quaterniond(
+      extrinsic_rotation_xyzw[3], extrinsic_rotation_xyzw[0],
+      extrinsic_rotation_xyzw[1], extrinsic_rotation_xyzw[2]);
+    if (lidar_to_imu_rotation_.norm() <= 1.0e-9) {
+      throw std::runtime_error("lidar_to_imu_rotation_xyzw must have non-zero norm");
+    }
+    lidar_to_imu_rotation_.normalize();
 
     estimator_ =
       std::make_unique<spline::ContinuousTimeSlidingWindowEstimator>(options);
@@ -2739,7 +2849,9 @@ private:
     while (!deferred_plane_map_updates_.empty()) {
       auto update = std::move(deferred_plane_map_updates_.front());
       deferred_plane_map_updates_.pop_front();
-      if (estimator_ && update.stamp_ns < estimator_->oldest_active_knot_stamp_ns()) {
+      // estimator_ is guaranteed non-null by the guard at function entry and
+      // cannot change while the caller holds estimator_mutex_.
+      if (update.stamp_ns < estimator_->oldest_active_knot_stamp_ns()) {
         ++deferred_plane_map_update_dropped_;
         continue;
       }
@@ -2778,32 +2890,42 @@ private:
     extrinsics.q_lidar_to_imu = lidar_to_imu_rotation_;
     extrinsics.p_lidar_in_imu = lidar_to_imu_translation_;
 
+    PointCloudReadView cloud_view;
+    std::string cloud_error;
+    if (!prepare_pointcloud_read_view(*msg, cloud_view, cloud_error)) {
+      ++pointcloud_invalid_frames_;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "dropping malformed PointCloud2: %s", cloud_error.c_str());
+      return;
+    }
+    if (cloud_view.layout.point_count == 0U) {
+      ++pointcloud_messages_;
+      return;
+    }
+    if (cloud_view.time != nullptr) {
+      ++pointcloud_time_field_frames_;
+    }
+
     if (enable_voxel_plane_extraction_) {
       std::vector<Eigen::Vector3d> points;
       std::vector<int64_t> point_stamps_ns;
-      points.reserve(static_cast<std::size_t>(msg->width) * msg->height / 4);
-      point_stamps_ns.reserve(static_cast<std::size_t>(msg->width) * msg->height / 4);
-      const auto * time_field = find_point_time_field(*msg);
-      if (time_field != nullptr) {
-        ++pointcloud_time_field_frames_;
-      }
-      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-      sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
-      size_t point_index = 0U;
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++point_index) {
-        const float fx = *iter_x;
-        const float fy = *iter_y;
-        const float fz = *iter_z;
-        if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz)) {
+      points.reserve(cloud_view.layout.point_count / 4U);
+      point_stamps_ns.reserve(cloud_view.layout.point_count / 4U);
+      for (size_t point_index = 0U;
+        point_index < cloud_view.layout.point_count; ++point_index)
+      {
+        Eigen::Vector3d point;
+        if (!read_xyz(*msg, cloud_view, point_index, point)) {
           continue;
         }
         int64_t point_stamp_ns = stamp_ns;
-        if (time_field != nullptr) {
-          const auto decoded_stamp = decode_point_stamp_ns(*msg, time_field, point_index, stamp_ns);
+        if (cloud_view.time != nullptr) {
+          const auto decoded_stamp = decode_point_stamp_ns(
+            *msg, cloud_view.layout, cloud_view.time, point_index, stamp_ns);
           if (decoded_stamp.has_value()) {
-            const double abs_offset_s =
-              std::abs(static_cast<double>(decoded_stamp.value() - stamp_ns) * 1.0e-9);
+            const double abs_offset_s = absolute_stamp_delta_seconds(
+              decoded_stamp.value(), stamp_ns);
             pointcloud_last_max_abs_point_time_offset_s_ =
               std::max(pointcloud_last_max_abs_point_time_offset_s_, abs_offset_s);
             if (abs_offset_s <= lidar_max_abs_point_time_offset_s_) {
@@ -2816,10 +2938,7 @@ private:
             ++pointcloud_invalid_point_times_;
           }
         }
-        points.emplace_back(
-          static_cast<double>(fx),
-          static_cast<double>(fy),
-          static_cast<double>(fz));
+        points.push_back(point);
         point_stamps_ns.push_back(point_stamp_ns);
       }
       const auto planes = plane_extractor_.extract(points);
@@ -3042,40 +3161,33 @@ private:
     if (enable_lidar_pose_prior_factor_ || enable_lidar_scan_to_scan_prior_ ||
       enable_visual_se3_prior_)
     {
-      points.reserve(static_cast<std::size_t>(msg->width) * msg->height / 4);
+      points.reserve(cloud_view.layout.point_count / 4U);
     }
-    point_stamps_ns.reserve(static_cast<std::size_t>(msg->width) * msg->height / 4);
-    const auto * time_field = find_point_time_field(*msg);
-    if (time_field != nullptr) {
-      ++pointcloud_time_field_frames_;
-    }
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
-    size_t point_index = 0U;
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++point_index) {
+    point_stamps_ns.reserve(cloud_view.layout.point_count / 4U);
+    for (size_t point_index = 0U;
+      point_index < cloud_view.layout.point_count; ++point_index)
+    {
       if (stride_counter++ % std::max(1, pointcloud_subsample_stride_) != 0) {
         continue;
       }
-      const float fx = *iter_x;
-      const float fy = *iter_y;
-      const float fz = *iter_z;
-      if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz)) {
+      Eigen::Vector3d point;
+      if (!read_xyz(*msg, cloud_view, point_index, point)) {
         continue;
       }
-      const double rx = static_cast<double>(fx);
-      const double ry = static_cast<double>(fy);
-      const double rz = static_cast<double>(fz);
+      const double rx = point.x();
+      const double ry = point.y();
+      const double rz = point.z();
       const double range = std::sqrt(rx * rx + ry * ry + rz * rz);
       if (range < pointcloud_min_range_m_ || range > pointcloud_max_range_m_) {
         continue;
       }
       int64_t point_stamp_ns = stamp_ns;
-      if (time_field != nullptr) {
-        const auto decoded_stamp = decode_point_stamp_ns(*msg, time_field, point_index, stamp_ns);
+      if (cloud_view.time != nullptr) {
+        const auto decoded_stamp = decode_point_stamp_ns(
+          *msg, cloud_view.layout, cloud_view.time, point_index, stamp_ns);
         if (decoded_stamp.has_value()) {
-          const double abs_offset_s =
-            std::abs(static_cast<double>(decoded_stamp.value() - stamp_ns) * 1.0e-9);
+          const double abs_offset_s = absolute_stamp_delta_seconds(
+            decoded_stamp.value(), stamp_ns);
           pointcloud_last_max_abs_point_time_offset_s_ =
             std::max(pointcloud_last_max_abs_point_time_offset_s_, abs_offset_s);
           if (abs_offset_s <= lidar_max_abs_point_time_offset_s_) {
@@ -4945,6 +5057,7 @@ private:
   double lidar_plane_normal_huber_delta_rad_{0.10};
   std::size_t accepted_pointcloud_correspondences_{0};
   std::size_t pointcloud_messages_{0};
+  std::size_t pointcloud_invalid_frames_{0};
   std::size_t pointcloud_time_field_frames_{0};
   std::size_t pointcloud_timed_points_{0};
   std::size_t pointcloud_invalid_point_times_{0};
@@ -5143,13 +5256,26 @@ private:
 
 int main(int argc, char ** argv)
 {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<gaussian_lic_tracking::ContinuousTimeNode>();
-  if (!node->deterministic_bag_path().empty()) {
-    node->run_deterministic_replay();
-  } else {
-    rclcpp::spin(node);
+  int exit_code = 0;
+  bool initialized = false;
+  try {
+    rclcpp::init(argc, argv);
+    initialized = true;
+    auto node = std::make_shared<gaussian_lic_tracking::ContinuousTimeNode>();
+    if (!node->deterministic_bag_path().empty()) {
+      node->run_deterministic_replay();
+    } else {
+      rclcpp::spin(node);
+    }
+  } catch (const std::exception & error) {
+    std::fprintf(stderr, "continuous_time_node: %s\n", error.what());
+    exit_code = 1;
+  } catch (...) {
+    std::fprintf(stderr, "continuous_time_node: unknown fatal error\n");
+    exit_code = 1;
   }
-  rclcpp::shutdown();
-  return 0;
+  if (initialized && rclcpp::ok()) {
+    rclcpp::shutdown();
+  }
+  return exit_code;
 }

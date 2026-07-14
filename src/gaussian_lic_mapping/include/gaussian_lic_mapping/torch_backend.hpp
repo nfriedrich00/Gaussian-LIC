@@ -41,6 +41,7 @@ struct TorchGaussianMap
   torch::Tensor scaling;
   torch::Tensor rotation;
   torch::Tensor opacity;
+  torch::Tensor exposure;
   torch::Tensor xyz_exp_avg;
   torch::Tensor xyz_exp_avg_sq;
   torch::Tensor features_dc_exp_avg;
@@ -53,6 +54,9 @@ struct TorchGaussianMap
   torch::Tensor rotation_exp_avg_sq;
   torch::Tensor opacity_exp_avg;
   torch::Tensor opacity_exp_avg_sq;
+  torch::Tensor exposure_exp_avg;
+  torch::Tensor exposure_exp_avg_sq;
+  uint64_t exposure_step{0};
   torch::Tensor xyz_gradient_accum;
   torch::Tensor xyz_gradient_vector_accum;
   torch::Tensor xyz_gradient_denom;

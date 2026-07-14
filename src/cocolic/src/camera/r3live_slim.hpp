@@ -33,7 +33,14 @@ namespace cocolic
   public:
     typedef std::shared_ptr<R3LIVE> Ptr;
 
+    // Offline rosbag replay already refreshes projection candidates
+    // synchronously in Rgbmap_tracker. Starting Global_map's wall-clock
+    // service as well races that deterministic path and changes the visual
+    // factor set from run to run.
+    static constexpr int kStartProjectionService = 0;
+
     R3LIVE(const YAML::Node &node, const ExtrinsicParam &EP_CtoI)
+        : m_map_rgb_pts(kStartProjectionService)
     {
       // --- camera intrinsics / distortion / extrinsics (from camera.yaml) ---
       m_vio_image_width = node["image_width"].as<double>();

@@ -11,7 +11,7 @@ ModuleNotFoundError: No module named 'rosidl_adapter'
 Use the build wrapper:
 
 ```bash
-./scripts/build_ros2.sh
+./scripts/build_ros2.sh --cpu-only
 ```
 
 It pins ROS2 interface generation to `/usr/bin/python3`.

@@ -18,6 +18,7 @@
 
 #include "trajectory.h"
 #include <fstream>
+#include <stdexcept>
 
 namespace cocolic {
 
@@ -197,6 +198,9 @@ SE3d Trajectory::GetSensorPoseNURBS(const int64_t timestamp,
 void Trajectory::ToTUMTxt(std::string traj_path, int64_t maxtime, bool is_evo_viral, double dt) {
   std::ofstream outfile;
   outfile.open(traj_path);
+  if (!outfile.is_open()) {
+    throw std::runtime_error("Unable to open trajectory output '" + traj_path + "'");
+  }
   outfile.setf(std::ios::fixed);
 
   int64_t min_time = 0;
@@ -221,6 +225,10 @@ void Trajectory::ToTUMTxt(std::string traj_path, int64_t maxtime, bool is_evo_vi
     outfile.precision(5);
     outfile << p(0) << " " << p(1) << " " << p(2) << " " << q.x() << " "
             << q.y() << " " << q.z() << " " << q.w() << "\n";
+  }
+  outfile.flush();
+  if (!outfile) {
+    throw std::runtime_error("Unable to write trajectory output '" + traj_path + "'");
   }
   outfile.close();
   std::cout << "\n🍺 Save trajectory at " << traj_path << std::endl;

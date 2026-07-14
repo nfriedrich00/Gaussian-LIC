@@ -33,6 +33,9 @@
 #include <memory>
 #include <vector>
 #include <cmath>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <cocolic/msg/feature_cloud.hpp>
 // #define M_PI 3.14159265358979
 #define IS_VALID(a) ((abs(a) > 1e8) ? true : false)
 
@@ -74,13 +77,8 @@ namespace cocolic
     E_jump edj[2];
     Feature ftype;
     orgtype()
-    {
-      range = 0;
-      edj[Prev] = Nr_nor;
-      edj[Next] = Nr_nor;
-      ftype = Nor;
-      intersect = 2;
-    }
+        : range(0.0), dista(0.0), angle{0.0, 0.0}, intersect(2.0),
+          edj{Nr_nor, Nr_nor}, ftype(Nor) {}
   };
 
   // ROS2 port replacement for livox_ros_driver::CustomMsg / CustomPoint.
@@ -89,11 +87,11 @@ namespace cocolic
   // feature-extraction bodies stay verbatim (lidar_msg-> preserved via ConstPtr).
   struct CustomPointLite
   {
-    float x, y, z;
-    uint8_t reflectivity;  // <- PointCloud2 intensity
-    uint8_t tag;
-    uint8_t line;
-    uint32_t offset_time;  // ns offset within scan (Livox per-point time)
+    float x = 0.0F, y = 0.0F, z = 0.0F;
+    uint8_t reflectivity = 0;  // <- PointCloud2 intensity
+    uint8_t tag = 0;
+    uint8_t line = 0;
+    uint32_t offset_time = 0;  // ns offset within scan (Livox per-point time)
   };
 
   struct CustomMsgLite
@@ -111,7 +109,8 @@ namespace cocolic
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     typedef std::shared_ptr<LivoxFeatureExtraction> Ptr;
 
-    LivoxFeatureExtraction(const YAML::Node &node);
+    LivoxFeatureExtraction(const YAML::Node &node,
+                           const rclcpp::Node::SharedPtr &ros_node = nullptr);
 
     //
     bool ParsePointCloud(const CustomMsgLite::ConstPtr &lidar_msg,
@@ -151,10 +150,15 @@ namespace cocolic
     bool checkCorner(const RTPointCloud &pl, std::vector<orgtype> &types, uint i,
                      Surround nor_dir);
 
-    void PublishCloud(std::string frame_id);  // ROS2 port: no-op stub (debug viz)
+    void PublishCloud(int64_t stamp_ns);
 
   private:
-    // ROS2 port: dropped ros::NodeHandle + debug-viz publishers/subscriber.
+    rclcpp::Node::SharedPtr ros_node_;
+    std::string debug_frame_ = "lidar";
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_corner_cloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_surface_cloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_full_cloud_;
+    rclcpp::Publisher<cocolic::msg::FeatureCloud>::SharedPtr pub_feature_cloud_;
 
     int n_scan;
     double blind, inf_bound;

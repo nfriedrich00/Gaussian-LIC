@@ -23,6 +23,7 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <boost/sort/spreadsort/spreadsort.hpp>
 #include <iostream>
+#include <stdexcept>
 
 #include <utils/mypcl_cloud_type.h>
 
@@ -40,21 +41,19 @@ inline float PointDistance(const TPoint& p1, const TPoint& p2) {
 }
 
 inline float GetCloudMaxTime(const RTPointCloud::Ptr cloud) {
-  assert(cloud->size() > 0 && "[GetCloudMaxTime] input empty cloud.");
-  double t_max = cloud->back().time;
-  for (size_t i = cloud->size() - 1; i > 0; i--) {
-    double t_point = cloud->points[i].time;
-    if (t_max < t_point) t_max = t_point;
+  if (!cloud || cloud->empty()) return 0.0F;
+  int64_t t_max = cloud->front().time;
+  for (const auto& point : cloud->points) {
+    if (t_max < point.time) t_max = point.time;
   }
-  return t_max;
+  return static_cast<float>(t_max);
 }
 
 inline int64_t GetCloudMaxTimeNs(const RTPointCloud::Ptr cloud) {
-  assert(cloud->size() > 0 && "[GetCloudMaxTime] input empty cloud.");
-  int64_t t_max = cloud->back().time;
-  for (size_t i = cloud->size() - 1; i > 0; i--) {
-    int64_t t_point = cloud->points[i].time;
-    if (t_max < t_point) t_max = t_point;
+  if (!cloud || cloud->empty()) return 0;
+  int64_t t_max = cloud->front().time;
+  for (const auto& point : cloud->points) {
+    if (t_max < point.time) t_max = point.time;
   }
   return t_max;
 }
@@ -63,6 +62,7 @@ inline void FilterCloudByTimestamp(const RTPointCloud::Ptr& cloud_in,
                                    int64_t timestamp,
                                    RTPointCloud::Ptr& cloud_bef,
                                    RTPointCloud::Ptr& cloud_aft) {
+  if (!cloud_in || !cloud_bef || !cloud_aft) return;
   for (const auto& point : cloud_in->points) {
     if (point.time < timestamp)
       cloud_bef->push_back(point);
@@ -74,13 +74,14 @@ inline void FilterCloudByTimestamp(const RTPointCloud::Ptr& cloud_in,
 inline void OusterPointCloud2RTPointCloud(
     const OusterPointCloud ::Ptr& input_cloud,
     RTPointCloud::Ptr& output_cloud) {
+  if (!input_cloud || !output_cloud) return;
   output_cloud->header = input_cloud->header;
   output_cloud->height = input_cloud->height;
   output_cloud->width = input_cloud->width;
   output_cloud->resize(input_cloud->height * input_cloud->width);
   output_cloud->is_dense = input_cloud->is_dense;
 
-  RTPoint zero_point;
+  RTPoint zero_point{};
   zero_point.x = 0;
   zero_point.y = 0;
   zero_point.intensity = 0;
@@ -105,6 +106,7 @@ inline void OusterPointCloud2RTPointCloud(
 inline void RTPointCloudTmp2RTPointCloud(
     const RTPointCloudTmp ::Ptr& input_cloud,
     RTPointCloud::Ptr& output_cloud) {
+  if (!input_cloud || !output_cloud) return;
   output_cloud->header = input_cloud->header;
   output_cloud->height = input_cloud->height;
   output_cloud->width = input_cloud->width;
@@ -112,10 +114,10 @@ inline void RTPointCloudTmp2RTPointCloud(
   output_cloud->is_dense = input_cloud->is_dense;
 
   bool m2dgr_flag = false;
-  assert(input_cloud->size() > 0);
+  if (input_cloud->empty()) return;
   if (input_cloud->points[0].time < 0.0) m2dgr_flag = true;
 
-  RTPoint zero_point;
+  RTPoint zero_point{};
   zero_point.x = 0;
   zero_point.y = 0;
   zero_point.intensity = 0;
@@ -141,18 +143,20 @@ inline void RTPointCloudTmp2RTPointCloud(
 inline void RTPointCloudTmp2RTPointCloudHesai(
     const RTPointCloudTmpHesai ::Ptr& input_cloud,
     RTPointCloud::Ptr& output_cloud) {
+  if (!input_cloud || !output_cloud) return;
   output_cloud->header = input_cloud->header;
   output_cloud->height = input_cloud->height;
   output_cloud->width = input_cloud->width;
   output_cloud->resize(input_cloud->height * input_cloud->width);
   output_cloud->is_dense = input_cloud->is_dense;
 
-  RTPoint zero_point;
+  RTPoint zero_point{};
   zero_point.x = 0;
   zero_point.y = 0;
   zero_point.intensity = 0;
   zero_point.time = -1;
 
+  if (input_cloud->empty()) return;
   double first_timestamp = input_cloud->points[0].timestamp;
   for (size_t i = 0; i < input_cloud->size(); i++) {
     auto& src = input_cloud->points[i];
@@ -174,13 +178,14 @@ inline void RTPointCloudTmp2RTPointCloudHesai(
 inline void OusterPointCloudTmp2RTPointCloud(
     const OusterPointCloudTmp ::Ptr& input_cloud,
     RTPointCloud::Ptr& output_cloud) {
+  if (!input_cloud || !output_cloud) return;
   output_cloud->header = input_cloud->header;
   output_cloud->height = input_cloud->height;
   output_cloud->width = input_cloud->width;
   output_cloud->resize(input_cloud->height * input_cloud->width);
   output_cloud->is_dense = input_cloud->is_dense;
 
-  RTPoint zero_point;
+  RTPoint zero_point{};
   zero_point.x = 0;
   zero_point.y = 0;
   zero_point.intensity = 0;
@@ -206,7 +211,8 @@ inline void CloudToRelativeMeasureTime(RTPointCloud::Ptr& cloud,
                                        int64_t scan_timestamp,
                                        int64_t traj_start_time,
                                        int64_t duration = 0.11 * 1e9) {
-  RTPoint zero_point;
+  if (!cloud) return;
+  RTPoint zero_point{};
   zero_point.x = 0;
   zero_point.y = 0;
   zero_point.intensity = 0;
@@ -221,8 +227,9 @@ inline void CloudToRelativeMeasureTime(RTPointCloud::Ptr& cloud,
     if (dst.time < 0) continue;
 
     if (dst.time > duration) {
+      const uint16_t ring = dst.ring;
       dst = zero_point;
-      dst.ring = dst.ring;
+      dst.ring = ring;
     } else {
       dst.time = t_wrt_traj_start;
     }
@@ -232,11 +239,10 @@ inline void CloudToRelativeMeasureTime(RTPointCloud::Ptr& cloud,
 inline void RTPointCloudToPosCloud(const RTPointCloud::Ptr input_cloud,
                                    PosCloud::Ptr output_cloud,
                                    int64_t* max_time = NULL) {
-  assert(input_cloud->size() > 0 &&
-         "[RTPointCloudToPosCloud] input empty cloud.");
+  if (max_time) *max_time = 0;
+  if (!input_cloud || !output_cloud) return;
   output_cloud->header = input_cloud->header;
   output_cloud->resize(input_cloud->size());
-  if (max_time) *max_time = 0;
 
   size_t cnt = 0;
   for (auto const& v : input_cloud->points) {
@@ -288,9 +294,11 @@ struct cloud_point_index_idx {
 template <typename PointType>
 class VoxelFilter {
  public:
-  VoxelFilter() {}
+  VoxelFilter() : resolution_(0.0F), inverse_resolution_(0.0F) {}
 
   void SetResolution(float resolution) {
+    if (!std::isfinite(resolution) || resolution <= 0.0F)
+      throw std::invalid_argument("VoxelFilter resolution must be finite and positive");
     resolution_ = resolution;
     inverse_resolution_ = 1.0 / resolution_;
   }
@@ -307,6 +315,11 @@ class VoxelFilter {
   }
 
   void Filter(typename pcl::PointCloud<PointType>::Ptr output_cloud) {
+    if (!output_cloud)
+      throw std::invalid_argument("VoxelFilter output cloud is null");
+    if (!input_cloud_ || input_cloud_->empty()) return;
+    if (!(inverse_resolution_ > 0.0F))
+      throw std::logic_error("VoxelFilter resolution was not configured");
     pcl::getMinMax3D<PointType>(*input_cloud_, min_map_, max_map_);
     min_b_[0] = static_cast<int>(floor(min_map_[0] * inverse_resolution_));
     max_b_[0] = static_cast<int>(floor(max_map_[0] * inverse_resolution_));

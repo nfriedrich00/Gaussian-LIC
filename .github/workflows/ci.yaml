@@ -80,6 +80,7 @@ jobs:
             libpcl-dev \
             libyaml-cpp-dev \
             python3-colcon-common-extensions \
+            python3-pytest \
             python3-yaml \
             ripgrep \
             ros-${ROS_DISTRO}-cv-bridge \
@@ -103,7 +104,11 @@ jobs:
           /usr/bin/python3 -m py_compile \
             scripts/*.py \
             src/gaussian_lic_bringup/launch/run_bag.launch.py \
+            src/gaussian_lic_frontend/scripts/livox_custom_to_pointcloud2.py \
             src/gaussian_lic_tools/gaussian_lic_tools/*.py
+          /usr/bin/python3 src/gaussian_lic_frontend/scripts/livox_custom_to_pointcloud2.py --self-test
+          (cd src/gaussian_lic_bringup && /usr/bin/python3 -m pytest -q test)
+          (cd src/gaussian_lic_tools && /usr/bin/python3 -m pytest -q test)
           ./scripts/check_profiles.py
           ./scripts/check_ros2_semantics_contract.py
           ./scripts/check_native_production_preset.py
@@ -118,16 +123,16 @@ jobs:
           set +u
           source /opt/ros/${ROS_DISTRO}/setup.bash
           set -u
-          colcon build --event-handlers console_direct+
+          ./scripts/build_ros2.sh --cpu-only --event-handlers console_direct+
 
-      - name: Native tracking probes
+      - name: Workspace tests
         shell: bash
         run: |
           set -euo pipefail
           set +u
           source /opt/ros/${ROS_DISTRO}/setup.bash
           set -u
-          colcon test --packages-select gaussian_lic_tracking --event-handlers console_direct+
+          colcon test --event-handlers console_direct+
           colcon test-result --verbose
 
       - name: Jazzy synthetic replay smoke

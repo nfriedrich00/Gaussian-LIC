@@ -14,6 +14,16 @@ def generate_launch_description():
     raw_depth_topic = LaunchConfiguration("raw_depth_topic")
     raw_pointcloud_topic = LaunchConfiguration("raw_pointcloud_topic")
     raw_imu_topic = LaunchConfiguration("raw_imu_topic")
+    image_topic = LaunchConfiguration("image_topic")
+    camera_info_topic = LaunchConfiguration("camera_info_topic")
+    depth_topic = LaunchConfiguration("depth_topic")
+    pointcloud_topic = LaunchConfiguration("pointcloud_topic")
+    pose_topic = LaunchConfiguration("pose_topic")
+    odometry_topic = LaunchConfiguration("odometry_topic")
+    path_topic = LaunchConfiguration("path_topic")
+    world_frame = LaunchConfiguration("world_frame")
+    child_frame = LaunchConfiguration("child_frame")
+    max_path_length = LaunchConfiguration("max_path_length")
     deterministic_bag_path = LaunchConfiguration("deterministic_bag_path")
     deterministic_feedback_bag_path = LaunchConfiguration("deterministic_feedback_bag_path")
     output_tum_path = LaunchConfiguration("output_tum_path")
@@ -44,6 +54,21 @@ def generate_launch_description():
         "rendered_feedback_ingress_drain_period_ms"
     )
     gaussian_map_topic = LaunchConfiguration("gaussian_map_topic")
+    visual_max_pixels = LaunchConfiguration("visual_max_pixels")
+    enable_imu_gravity_autocalibration = LaunchConfiguration(
+        "enable_imu_gravity_autocalibration"
+    )
+    imu_gravity_autocalibration_samples = LaunchConfiguration(
+        "imu_gravity_autocalibration_samples"
+    )
+    imu_gravity_magnitude_m_s2 = LaunchConfiguration("imu_gravity_magnitude_m_s2")
+    imu_gravity_w = LaunchConfiguration("imu_gravity_w")
+    imu_gravity_autocalibration_min_norm_m_s2 = LaunchConfiguration(
+        "imu_gravity_autocalibration_min_norm_m_s2"
+    )
+    imu_gravity_autocalibration_max_norm_m_s2 = LaunchConfiguration(
+        "imu_gravity_autocalibration_max_norm_m_s2"
+    )
     serialize_callbacks = LaunchConfiguration("serialize_callbacks")
     sensor_qos_reliability = LaunchConfiguration("sensor_qos_reliability")
     sensor_qos_history = LaunchConfiguration("sensor_qos_history")
@@ -628,6 +653,18 @@ def generate_launch_description():
             DeclareLaunchArgument("raw_depth_topic", default_value="/camera/depth"),
             DeclareLaunchArgument("raw_pointcloud_topic", default_value="/livox/lidar"),
             DeclareLaunchArgument("raw_imu_topic", default_value="/imu"),
+            DeclareLaunchArgument("image_topic", default_value="/image_for_gs"),
+            DeclareLaunchArgument("camera_info_topic", default_value="/camera_info_for_gs"),
+            DeclareLaunchArgument("depth_topic", default_value="/depth_for_gs"),
+            DeclareLaunchArgument("pointcloud_topic", default_value="/points_for_gs"),
+            DeclareLaunchArgument("pose_topic", default_value="/pose_for_gs"),
+            DeclareLaunchArgument(
+                "odometry_topic", default_value="/gaussian_lic/frontend/odometry"
+            ),
+            DeclareLaunchArgument("path_topic", default_value="/gaussian_lic/frontend/path"),
+            DeclareLaunchArgument("world_frame", default_value="map"),
+            DeclareLaunchArgument("child_frame", default_value="base_link"),
+            DeclareLaunchArgument("max_path_length", default_value="5000"),
             DeclareLaunchArgument("deterministic_bag_path", default_value=""),
             DeclareLaunchArgument("deterministic_feedback_bag_path", default_value=""),
             DeclareLaunchArgument("output_tum_path", default_value=""),
@@ -653,6 +690,17 @@ def generate_launch_description():
             DeclareLaunchArgument("rendered_feedback_ingress_drain_max_per_cycle", default_value="64"),
             DeclareLaunchArgument("rendered_feedback_ingress_drain_period_ms", default_value="5"),
             DeclareLaunchArgument("gaussian_map_topic", default_value="/gaussian_lic/gaussian_map"),
+            DeclareLaunchArgument("visual_max_pixels", default_value="200000"),
+            DeclareLaunchArgument("enable_imu_gravity_autocalibration", default_value="true"),
+            DeclareLaunchArgument("imu_gravity_autocalibration_samples", default_value="50"),
+            DeclareLaunchArgument("imu_gravity_magnitude_m_s2", default_value="9.80665"),
+            DeclareLaunchArgument("imu_gravity_w", default_value="[0.0, 0.0, -9.80665]"),
+            DeclareLaunchArgument(
+                "imu_gravity_autocalibration_min_norm_m_s2", default_value="6.0"
+            ),
+            DeclareLaunchArgument(
+                "imu_gravity_autocalibration_max_norm_m_s2", default_value="14.0"
+            ),
             DeclareLaunchArgument("serialize_callbacks", default_value="true"),
             DeclareLaunchArgument("sensor_qos_reliability", default_value="best_effort"),
             DeclareLaunchArgument("sensor_qos_history", default_value="keep_last"),
@@ -1009,13 +1057,21 @@ def generate_launch_description():
                 parameters=[
                     {
                         "publish_tf": publish_tf,
-                        "world_frame": "map",
-                        "child_frame": "base_link",
+                        "world_frame": world_frame,
+                        "child_frame": child_frame,
                         "raw_image_topic": raw_image_topic,
                         "raw_camera_info_topic": raw_camera_info_topic,
                         "raw_depth_topic": raw_depth_topic,
                         "raw_pointcloud_topic": raw_pointcloud_topic,
                         "raw_imu_topic": raw_imu_topic,
+                        "image_topic": image_topic,
+                        "camera_info_topic": camera_info_topic,
+                        "depth_topic": depth_topic,
+                        "pointcloud_topic": pointcloud_topic,
+                        "pose_topic": pose_topic,
+                        "odometry_topic": odometry_topic,
+                        "path_topic": path_topic,
+                        "max_path_length": max_path_length,
                         "deterministic_bag_path": deterministic_bag_path,
                         "deterministic_feedback_bag_path": deterministic_feedback_bag_path,
                         "output_tum_path": output_tum_path,
@@ -1038,6 +1094,17 @@ def generate_launch_description():
                         "rendered_feedback_ingress_drain_max_per_cycle": rendered_feedback_ingress_drain_max_per_cycle,
                         "rendered_feedback_ingress_drain_period_ms": rendered_feedback_ingress_drain_period_ms,
                         "gaussian_map_topic": gaussian_map_topic,
+                        "visual_max_pixels": visual_max_pixels,
+                        "enable_imu_gravity_autocalibration": enable_imu_gravity_autocalibration,
+                        "imu_gravity_autocalibration_samples": imu_gravity_autocalibration_samples,
+                        "imu_gravity_magnitude_m_s2": imu_gravity_magnitude_m_s2,
+                        "imu_gravity_w": imu_gravity_w,
+                        "imu_gravity_autocalibration_min_norm_m_s2": (
+                            imu_gravity_autocalibration_min_norm_m_s2
+                        ),
+                        "imu_gravity_autocalibration_max_norm_m_s2": (
+                            imu_gravity_autocalibration_max_norm_m_s2
+                        ),
                         "serialize_callbacks": serialize_callbacks,
                         "sensor_qos_reliability": sensor_qos_reliability,
                         "sensor_qos_history": sensor_qos_history,

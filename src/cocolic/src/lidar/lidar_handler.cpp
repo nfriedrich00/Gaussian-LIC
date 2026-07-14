@@ -67,7 +67,8 @@ namespace cocolic
     surf_min_valid_num_ = cur_scan_node["surf_min_valid_num"].as<int>();
     corner_leaf_size_ = cur_scan_node["corner_leaf_size"].as<float>();
     surface_leaf_size_ = cur_scan_node["surface_leaf_size"].as<float>();
-    cor_downsample_ = cur_scan_node["correspondence_downsample"].as<int>();
+    cor_downsample_ = yaml::RequirePositive<int>(
+        cur_scan_node, "correspondence_downsample", "lidar.current_scan_param");
 
     const YAML::Node &keyframe_node = node["keyframe_strategy"];
     keyframe_angle_degree_ = keyframe_node["angle_degree"].as<double>();

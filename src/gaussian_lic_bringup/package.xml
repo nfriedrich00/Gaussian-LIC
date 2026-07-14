@@ -11,10 +11,19 @@
   <exec_depend>gaussian_lic_tools</exec_depend>
   <exec_depend>gaussian_lic_frontend</exec_depend>
   <exec_depend>gaussian_lic_mapping</exec_depend>
+  <exec_depend>gaussian_lic_tracking</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rclcpp_components</exec_depend>
   <exec_depend>rosbag2_transport</exec_depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
+  <exec_depend>ros2bag</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rviz2</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

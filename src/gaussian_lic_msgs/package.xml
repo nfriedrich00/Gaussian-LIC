@@ -2,8 +2,8 @@
 <package format="3">
   <name>gaussian_lic_msgs</name>
   <version>0.1.0</version>
-  <description>Messages and services for the ROS2 Gaussian-LIC port.</description>
-  <maintainer email="frank@example.com">Frank</maintainer>
+  <description>Messages and services for the ROS2 Gaussian-LIC and Coco-LIC ports.</description>
+  <maintainer email="kfeng8021@gmail.com">Frank</maintainer>
   <license>GPL-3.0-or-later</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

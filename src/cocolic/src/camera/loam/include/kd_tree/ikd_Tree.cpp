@@ -19,7 +19,15 @@ KD_TREE::~KD_TREE()
 {
     stop_thread();
     Delete_Storage_Disabled = true;
+    Rebuild_Ptr = nullptr;
+    if (STATIC_ROOT_NODE != nullptr)
+        STATIC_ROOT_NODE->left_son_ptr = nullptr;
     delete_tree_nodes(&Root_Node);
+    if (STATIC_ROOT_NODE != nullptr) {
+        pthread_mutex_destroy(&STATIC_ROOT_NODE->push_down_mutex_lock);
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
+    }
     PointVector ().swap(PCL_Storage);
     Rebuild_Logger.clear();
 }
@@ -162,15 +170,19 @@ void KD_TREE::start_thread(){
     pthread_mutex_init(&points_deleted_rebuild_mutex_lock, NULL);
     pthread_mutex_init(&working_flag_mutex, NULL);
     pthread_mutex_init(&search_flag_mutex, NULL);
-    pthread_create(&rebuild_thread, NULL, multi_thread_ptr, (void*) this);
-    printf("Multi thread started \n");
+    rebuild_thread_started =
+        pthread_create(&rebuild_thread, NULL, multi_thread_ptr, (void*) this) == 0;
+    if (rebuild_thread_started) printf("Multi thread started \n");
 }
 
 void KD_TREE::stop_thread(){
     pthread_mutex_lock(&termination_flag_mutex_lock);
     termination_flag = true;
     pthread_mutex_unlock(&termination_flag_mutex_lock);
-    if (rebuild_thread) pthread_join(rebuild_thread, NULL);
+    if (rebuild_thread_started) {
+        pthread_join(rebuild_thread, NULL);
+        rebuild_thread_started = false;
+    }
     pthread_mutex_destroy(&termination_flag_mutex_lock);
     pthread_mutex_destroy(&rebuild_logger_mutex_lock);
     pthread_mutex_destroy(&rebuild_ptr_mutex_lock);
@@ -182,6 +194,7 @@ void KD_TREE::stop_thread(){
 void * KD_TREE::multi_thread_ptr(void * arg){
     KD_TREE * handle = (KD_TREE*) arg;
     handle->multi_thread_rebuild();
+    return nullptr;
 }
 
 void KD_TREE::multi_thread_rebuild(){
@@ -270,14 +283,23 @@ void KD_TREE::multi_thread_rebuild(){
             if (new_root_node != nullptr) new_root_node->father_ptr = father_ptr;
             (*Rebuild_Ptr) = new_root_node;
             int valid_old = old_root_node->TreeSize-old_root_node->invalid_point_num;
-            int valid_new = new_root_node->TreeSize-new_root_node->invalid_point_num;
+            int valid_new = new_root_node == nullptr
+                                ? 0
+                                : new_root_node->TreeSize -
+                                      new_root_node->invalid_point_num;
             if (father_ptr == STATIC_ROOT_NODE) Root_Node = STATIC_ROOT_NODE->left_son_ptr;
             KD_TREE_NODE * update_root = *Rebuild_Ptr;
             while (update_root != nullptr && update_root != Root_Node){
                 update_root = update_root->father_ptr;
+                if (update_root == nullptr || update_root == Root_Node) break;
                 if (update_root->working_flag) break;
-                if (update_root == update_root->father_ptr->left_son_ptr && update_root->father_ptr->need_push_down_to_left) break;
-                if (update_root == update_root->father_ptr->right_son_ptr && update_root->father_ptr->need_push_down_to_right) break;
+                KD_TREE_NODE * parent = update_root->father_ptr;
+                if (parent != nullptr &&
+                    update_root == parent->left_son_ptr &&
+                    parent->need_push_down_to_left) break;
+                if (parent != nullptr &&
+                    update_root == parent->right_son_ptr &&
+                    parent->need_push_down_to_right) break;
                 Update(update_root);
             }
             pthread_mutex_lock(&search_flag_mutex);
@@ -336,7 +358,14 @@ void KD_TREE::run_operation(KD_TREE_NODE ** root, Operation_Logger_Type operatio
 
 void KD_TREE::Build(PointVector point_cloud){
     if (Root_Node != nullptr){
+        if (STATIC_ROOT_NODE != nullptr)
+            STATIC_ROOT_NODE->left_son_ptr = nullptr;
         delete_tree_nodes(&Root_Node);
+    }
+    if (STATIC_ROOT_NODE != nullptr) {
+        pthread_mutex_destroy(&STATIC_ROOT_NODE->push_down_mutex_lock);
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
     }
     if (point_cloud.size() == 0) return;
     STATIC_ROOT_NODE = new KD_TREE_NODE;
@@ -1108,6 +1137,7 @@ void KD_TREE::Push_Down(KD_TREE_NODE *root){
 }
 
 void KD_TREE::Update(KD_TREE_NODE * root){
+    if (root == nullptr) return;
     KD_TREE_NODE * left_son_ptr = root->left_son_ptr;
     KD_TREE_NODE * right_son_ptr = root->right_son_ptr;
     float tmp_range_x[2] = {INFINITY, -INFINITY};
@@ -1274,10 +1304,10 @@ void KD_TREE::flatten(KD_TREE_NODE * root, PointVector &Storage, delete_point_st
 
 void KD_TREE::delete_tree_nodes(KD_TREE_NODE ** root){
     if (*root == nullptr) return;
-    Push_Down(*root);
     delete_tree_nodes(&(*root)->left_son_ptr);
     delete_tree_nodes(&(*root)->right_son_ptr);
 
+    pthread_mutex_destroy(&(*root)->push_down_mutex_lock);
     delete *root;
     *root = nullptr;
 

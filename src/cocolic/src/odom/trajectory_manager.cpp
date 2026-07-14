@@ -19,10 +19,13 @@
 #include <odom/factor/analytic_diff/image_feature_factor.h>
 #include <odom/factor/analytic_diff/trajectory_value_factor.h>
 #include <odom/trajectory_manager.h>
+#include <utils/config_path.h>
 #include <ros/assert.h>
 #include <utils/log_utils.h>
 
 #include <fstream>
+#include <cmath>
+#include <limits>
 std::fstream myfile_t_ba;
 namespace cocolic
 {
@@ -39,7 +42,7 @@ namespace cocolic
         cam_marg_info(nullptr)
   {
     std::string imu_yaml = node["imu_yaml"].as<std::string>();
-    YAML::Node imu_node = YAML::LoadFile(config_path + imu_yaml);
+    YAML::Node imu_node = YAML::LoadFile(ResolveConfigPath(config_path, imu_yaml));
     imu_state_estimator_ = std::make_shared<ImuStateEstimator>(imu_node);
 
     if_use_init_bg_ = imu_node["if_use_init_bg"].as<bool>();
@@ -307,8 +310,7 @@ namespace cocolic
     }
 
     ceres::Solver::Summary summary = estimator->Solve(50, false);
-    static int init_cnt = 0;
-    init_cnt++;
+    ++init_solve_count_;
     // LOG(INFO) << init_cnt << " TrajInitSolver " << summary.BriefReport();
     // LOG(INFO) << init_cnt << " TrajInit Successful/Unsuccessful steps: "
     //           << summary.num_successful_steps << "/"
@@ -446,9 +448,9 @@ namespace cocolic
             trajectory_->GetSensorEP(CameraSensor).p,
             K_, opt_weight_.image_weight);
 
-        // GL2 step-2c: render-photometric factor — align the observed image to the
+        // Render-photometric: render-photometric factor — align the observed image to the
         // rendered-map reference patch (sampled at this pnp pixel). Refines the same
-        // continuous-time pose the PnP factor touches; reuses track A's native factor.
+        // continuous-time pose the PnP factor touches; reuses the native Coco-LIC factor.
         if (rp_enable_ && i < (int)rp_valid_.size() && rp_valid_[i] &&
             !rp_observed_gray_.empty() && (int)rp_patches_[i].size() > 0)
         {
@@ -467,7 +469,7 @@ namespace cocolic
     }
 
     TicToc t_opt;
-    static int loam_cnt = 0;
+    ++loam_solve_count_;
     ceres::Solver::Summary summary = estimator->Solve(iteration, false);
     double opt_time = t_opt.toc();
     // LOG(INFO) << "[t_opt] " << opt_time << std::endl;
@@ -631,25 +633,33 @@ namespace cocolic
 
       if (!drop_set.empty())
       {
-        double weight = LidarWeightAt(v.t_point);  // GL2 demo: time-windowed degradation
+        double weight = LidarWeightAt(v.t_point);  // Diagnostic: time-windowed degradation
         if (use_lidar_scale)
         {
           weight *= v.scale;
         }
+        if (!std::isfinite(weight) || std::fabs(weight) <=
+                                          std::numeric_limits<double>::epsilon())
+          continue;
         ceres::CostFunction *cost_function = new analytic_derivative::LoamFeatureFactorNURBS(
             time_ns, v, su, blending_matrix, cumulative_blending_matrix,
             S_GtoM, p_GinM, S_LtoI, p_LinI, weight);
-        ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(RType_LiDAR, cost_function, NULL,
-                                                                       vec, drop_set);
         int num_residuals = cost_function->num_residuals();
         Eigen::MatrixXd residuals;
         residuals.setZero(num_residuals, 1);
-        cost_function->Evaluate(vec.data(), residuals.data(), nullptr);
+        const bool evaluated =
+            cost_function->Evaluate(vec.data(), residuals.data(), nullptr);
         double dist = (residuals / weight).norm();
-        if (dist < 0.05)
+        if (evaluated && std::isfinite(dist) && dist < 0.05)
         // if (dist < 0.01)
         {
+          ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(
+              RType_LiDAR, cost_function, NULL, vec, drop_set);
           marginalization_info->addResidualBlockInfo(residual_block_info);
+        }
+        else
+        {
+          delete cost_function;
         }
       }
     }

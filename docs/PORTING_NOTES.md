@@ -33,10 +33,10 @@ Outputs:
 
 - Use configurable sensor-data QoS for image, point cloud, pose, camera info, depth, and IMU subscriptions. Defaults are `best_effort`, `keep_last`, depth `5`; `sensor_qos_reliability:=reliable` is available for reliable rosbag2 or driver outputs.
 - Keep estimator timestamp math in signed `int64_t` nanoseconds. Do not replace ROS1 `ros::Time` math with `rclcpp::Time` or double seconds inside B-spline, IMU, LiDAR deskew, or frame-sync code.
-- Strict replay and component launch must use a single-threaded executor until the frontend has deterministic stamp-ordered queues around every estimator update.
+- Strict replay keeps estimator mutation stamp-ordered and serialized; mapping composition may use a multi-threaded executor because sensor queues and GPU/map state are isolated into protected callback groups.
 - Use lifecycle nodes for long-running mapping/tracking components.
 - Keep GPU/CUDA code isolated from middleware glue.
-- `mapping_node` is available as both a standalone executable and an `rclcpp_components` plugin; launch with `use_composition:=true` to load it in the single-threaded `component_container`.
+- `mapping_node` is available as both a standalone executable and an `rclcpp_components` plugin; launch with `use_composition:=true` to load it in `component_container_mt`, allowing mutually-exclusive sensor and GPU callback groups to run concurrently.
 - Keep launch files dataset-agnostic; put dataset paths and remaps in config.
 - See `docs/ROS2_SEMANTICS.md` for the enforced time, QoS, executor, tf2, and rosbag replay contract.
 
@@ -293,10 +293,26 @@ Current machine state:
 ```text
 libtorch:  /home/frank/Software/libtorch
 CUDA:      /usr/local/cuda-12.8
-TensorRT:  not found
+TensorRT:  /home/frank/Software/TensorRT-10.9.0.34-cuda12.8
 ```
 
-The ROS2 parameter contract accepts `depth_completion`, `depth_completion_engine_path`, `patch_size`, `max_depth`, and `require_depth_topic`. The native TensorRT/SPNet wrapper is available when built with `GAUSSIAN_LIC_ENABLE_TENSORRT=ON`; without a configured SPNet `.engine` file, the mapper keeps using the provided depth topic or sparse point-projected depth.
+The ROS2 parameter contract accepts `depth_completion`,
+`depth_completion_engine_path`, `patch_size`, `max_depth`, and
+`require_depth_topic`. The native TensorRT/SPNet wrapper is available when built
+with `GAUSSIAN_LIC_ENABLE_TENSORRT=ON`. When completion is enabled, launch and
+the node now require a compatible engine and fail fast rather than silently
+substituting provided or sparse-projected depth. An empty profile path is
+resolved from `GAUSSIAN_LIC_SPNET_ENGINE`, then from the matching
+`~/Software/TensorRT-engines/spnet_<height>_<width>_fp16.engine`. Set
+`depth_completion:=false` explicitly for an intentional sparse-depth run.
+
+Upstream-style dataset profiles enable final train/test render evaluation and
+require the LPIPS TorchScript model. The model is installed from the locked
+upstream asset and can be overridden with `lpips_model_path` or
+`GAUSSIAN_LIC_LPIPS_MODEL`. A parity save now fails if the Gaussian map was not
+initialized; the debug RGB point-cloud export remains available only when final
+render evaluation was not requested. Evaluation replaces its prior
+`render`/`renders`, `gt`, `render_depth`, and manifest artifacts before writing.
 
 The optional torch backend can be built with:
 
@@ -435,7 +451,8 @@ enable_torch_gaussian_optimization:=true
 torch_gaussian_optimization_steps:=100
 torch_gaussian_optimization_sampling:=upstream_random
 torch_gaussian_optimization_seed:=20260505
-enable_torch_gaussian_pruning:=true
+enable_torch_gaussian_pruning:=false
+enable_non_upstream_density_control:=false
 torch_gaussian_max_foreground:=1500000
 torch_gaussian_device:=cuda
 ```
@@ -451,7 +468,15 @@ rotation:      [N, 4]
 opacity:       [N, 1]
 ```
 
-The torch backend now supports optional upstream-style skybox seeding, incremental foreground insertion from pending keyframe points, a dependency-gated photometric tensor update, and bounded-map pruning. When `enable_torch_gaussian_optimization:=true` and `torch_gaussian_optimization_steps` is positive, visible foreground Gaussians are projected into the keyframe image and a small Torch backward pass updates DC color and opacity logits from image supervision. When `enable_torch_gaussian_pruning:=true`, low-opacity foreground Gaussians can be removed and `torch_gaussian_max_foreground` can cap map growth. `render_mode:=rasterizer` publishes a CPU Gaussian splat preview from the live `TorchGaussianMap` using Gaussian centers, DC color, scale, opacity, and the current camera pose. It is still not the full mapper: the upstream CUDA rasterizer, densification, and full multi-term loss schedule remain separate porting steps. This keeps the heavy torch dependency compile-time optional while allowing the live ROS2 data path to exercise the same tensor boundaries, map-growth lifecycle, gradient-update hook, pruning hook, and rasterizer output topic that the full Gaussian core will need.
+The full Torch/CUDA profile now contains the upstream CUDA rasterizer, fused
+SSIM, visibility-masked sparse Adam, sparse-depth loss, upstream skybox and
+keyframe extension behavior, binary Gaussian PLY output, and final train/test
+visual-quality evaluation. SPNet completion validates known-depth bias, rejects
+Sobel edges, samples empty patches, adds new colored points, and preserves the
+original sparse optimization depth. Non-upstream pruning/densification remains
+available only behind `enable_non_upstream_density_control:=true`; standard
+profiles keep it disabled. See `docs/GAUSSIAN_MAPPER_PARITY.md` for the exact
+default and opt-in boundaries.
 
 After initialization and each keyframe extension, the node publishes the current map as chunked `gaussian_lic_msgs/msg/GaussianArray` on `/gaussian_lic/gaussian_map` with reliable transient-local QoS. The message uses public transport values:
 

@@ -11,6 +11,24 @@ option(GAUSSIAN_LIC_ENABLE_TORCH "Build optional libtorch/CUDA mapper backend pr
 option(GAUSSIAN_LIC_ENABLE_CUDA "Enable strict CUDA/Torch Gaussian backend build plumbing" OFF)
 option(GAUSSIAN_LIC_ENABLE_TENSORRT "Build optional TensorRT/SPNet depth completion backend" OFF)
 
+set(GAUSSIAN_LIC_TORCH_CAPABILITY false)
+set(GAUSSIAN_LIC_CUDA_CAPABILITY false)
+set(GAUSSIAN_LIC_TENSORRT_CAPABILITY false)
+if(GAUSSIAN_LIC_ENABLE_TORCH)
+  set(GAUSSIAN_LIC_TORCH_CAPABILITY true)
+endif()
+if(GAUSSIAN_LIC_ENABLE_CUDA)
+  set(GAUSSIAN_LIC_CUDA_CAPABILITY true)
+endif()
+if(GAUSSIAN_LIC_ENABLE_TENSORRT)
+  set(GAUSSIAN_LIC_TENSORRT_CAPABILITY true)
+endif()
+configure_file(
+  cmake/backend_capabilities.json.in
+  ${CMAKE_CURRENT_BINARY_DIR}/backend_capabilities.json
+  @ONLY
+)
+
 if(GAUSSIAN_LIC_ENABLE_CUDA AND NOT GAUSSIAN_LIC_ENABLE_TORCH)
   message(FATAL_ERROR "GAUSSIAN_LIC_ENABLE_CUDA requires GAUSSIAN_LIC_ENABLE_TORCH=ON")
 endif()
@@ -29,6 +47,8 @@ if(GAUSSIAN_LIC_ENABLE_CUDA OR GAUSSIAN_LIC_ENABLE_TENSORRT)
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(gaussian_lic_msgs REQUIRED)
@@ -38,21 +58,61 @@ find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2_ros REQUIRED)
+
+if(BUILD_TESTING)
+  enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(frame_data_parity_probe
+    src/frame_data.cpp
+    src/mapper_dataset.cpp
+    src/frame_data_parity_probe.cpp
+  )
+  target_include_directories(frame_data_parity_probe PRIVATE include)
+  ament_target_dependencies(frame_data_parity_probe
+    builtin_interfaces
+    cv_bridge
+    geometry_msgs
+    sensor_msgs
+  )
+  target_link_libraries(frame_data_parity_probe
+    Eigen3::Eigen
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME frame_data_parity COMMAND frame_data_parity_probe)
+  add_executable(optimization_sampling_probe
+    src/optimization_sampling.cpp
+    src/optimization_sampling_probe.cpp
+  )
+  target_include_directories(optimization_sampling_probe PRIVATE include)
+  target_link_libraries(optimization_sampling_probe Eigen3::Eigen)
+  add_test(NAME optimization_sampling_parity COMMAND optimization_sampling_probe)
+  add_test(
+    NAME mapping_concurrency_contract
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/mapping_concurrency_contract.py
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/mapping_node.cpp
+  )
+endif()
 
 set(MAPPING_NODE_SOURCES
   src/frame_data.cpp
   src/mapper_dataset.cpp
   src/mapping_node.cpp
+  src/optimization_sampling.cpp
 )
 
 set(MAPPING_NODE_DEPS
+  ament_index_cpp
+  builtin_interfaces
   cv_bridge
   gaussian_lic_msgs
   geometry_msgs
   nav_msgs
   rclcpp
   sensor_msgs
+  std_srvs
   tf2_ros
 )
 
@@ -95,6 +155,23 @@ install(TARGETS mapping_node_component
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/backend_capabilities.json
+  DESTINATION share/${PROJECT_NAME}
+)
+
+set(GAUSSIAN_LIC_LPIPS_MODEL_SOURCE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../external/Gaussian-LIC/src/lpips/lpips_alex.pt")
+if(EXISTS "${GAUSSIAN_LIC_LPIPS_MODEL_SOURCE}")
+  install(FILES "${GAUSSIAN_LIC_LPIPS_MODEL_SOURCE}"
+    DESTINATION share/${PROJECT_NAME}/models
+  )
+elseif(GAUSSIAN_LIC_ENABLE_CUDA)
+  message(FATAL_ERROR
+    "CUDA parity builds require external/Gaussian-LIC/src/lpips/lpips_alex.pt")
+else()
+  message(WARNING
+    "LPIPS model is unavailable; CUDA final-render evaluation will not be usable")
+endif()
 
 if(GAUSSIAN_LIC_ENABLE_TENSORRT)
   set(TENSORRT_ROOT "$ENV{TENSORRT_ROOT}" CACHE PATH "TensorRT SDK root")
@@ -131,10 +208,16 @@ if(GAUSSIAN_LIC_ENABLE_TENSORRT)
   target_compile_definitions(mapping_node_component PRIVATE GAUSSIAN_LIC_ENABLE_TENSORRT=1)
   target_link_libraries(mapping_node depth_completer)
   target_link_libraries(mapping_node_component depth_completer)
+  add_executable(depth_completer_probe src/depth_completer_probe.cpp)
+  target_include_directories(depth_completer_probe PRIVATE include)
+  target_link_libraries(depth_completer_probe depth_completer ${OpenCV_LIBS})
   install(TARGETS depth_completer
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
+  )
+  install(TARGETS depth_completer_probe
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 endif()
 
@@ -316,6 +399,9 @@ if(GAUSSIAN_LIC_ENABLE_TORCH)
       RUNTIME DESTINATION lib/${PROJECT_NAME}
     )
     install(TARGETS torch_cuda_backend_probe
+      RUNTIME DESTINATION lib/${PROJECT_NAME}
+    )
+    install(TARGETS gaussian_map_renderer
       RUNTIME DESTINATION lib/${PROJECT_NAME}
     )
   endif()

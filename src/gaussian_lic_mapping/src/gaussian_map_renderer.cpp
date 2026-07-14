@@ -65,8 +65,7 @@ struct TumPose
   Eigen::Vector3d t;     // body position in world
 };
 
-// Stream-parse the ASCII PLY into 62 float columns/row. Custom fast float parse
-// to avoid the heavy operator>> path on 1.18 GB.
+// Stream-parse upstream binary-little-endian or legacy ASCII Gaussian PLY.
 struct PlyColumns
 {
   int64_t n{0};
@@ -87,8 +86,19 @@ bool parse_ply(const std::string & path, PlyColumns & out)
   }
   std::string line;
   int64_t vertex_count = -1;
+  bool binary_little_endian = false;
+  bool format_seen = false;
   // header
   while (std::getline(in, line)) {
+    if (line.rfind("format ", 0) == 0) {
+      format_seen = true;
+      if (line == "format binary_little_endian 1.0") {
+        binary_little_endian = true;
+      } else if (line != "format ascii 1.0") {
+        std::cerr << "unsupported PLY format: " << line << "\n";
+        return false;
+      }
+    }
     if (line.rfind("element vertex", 0) == 0) {
       vertex_count = std::stoll(line.substr(std::string("element vertex").size()));
     }
@@ -96,8 +106,8 @@ bool parse_ply(const std::string & path, PlyColumns & out)
       break;
     }
   }
-  if (vertex_count <= 0) {
-    std::cerr << "PLY header missing vertex count\n";
+  if (vertex_count <= 0 || !format_seen) {
+    std::cerr << "PLY header missing vertex count or format\n";
     return false;
   }
   out.n = vertex_count;
@@ -108,8 +118,39 @@ bool parse_ply(const std::string & path, PlyColumns & out)
   out.scaling.resize(static_cast<size_t>(vertex_count) * 3U);
   out.rotation.resize(static_cast<size_t>(vertex_count) * 4U);
 
-  // Read remainder in large chunks; parse 59 floats per row with strtof.
   constexpr int kCols = 59;  // 3 + 3 + 45 + 1 + 3 + 4 = 59
+  if (binary_little_endian) {
+    float row[kCols];
+    for (int64_t r = 0; r < vertex_count; ++r) {
+      in.read(reinterpret_cast<char *>(row), sizeof(row));
+      if (in.gcount() != static_cast<std::streamsize>(sizeof(row))) {
+        std::cerr << "binary PLY truncated at row " << r << "\n";
+        return false;
+      }
+      const size_t i = static_cast<size_t>(r);
+      out.xyz[i * 3 + 0] = row[0];
+      out.xyz[i * 3 + 1] = row[1];
+      out.xyz[i * 3 + 2] = row[2];
+      out.dc[i * 3 + 0] = row[3];
+      out.dc[i * 3 + 1] = row[4];
+      out.dc[i * 3 + 2] = row[5];
+      for (int k = 0; k < 45; ++k) {
+        out.rest[i * 45 + static_cast<size_t>(k)] = row[6 + k];
+      }
+      out.opacity[i] = row[51];
+      out.scaling[i * 3 + 0] = row[52];
+      out.scaling[i * 3 + 1] = row[53];
+      out.scaling[i * 3 + 2] = row[54];
+      out.rotation[i * 4 + 0] = row[55];
+      out.rotation[i * 4 + 1] = row[56];
+      out.rotation[i * 4 + 2] = row[57];
+      out.rotation[i * 4 + 3] = row[58];
+    }
+    return true;
+  }
+
+  // Legacy ASCII fallback: read the remainder in one block and use strtof to
+  // avoid the very slow formatted-stream path on multi-gigabyte maps.
   std::string rest_of_file;
   {
     std::ostringstream ss;

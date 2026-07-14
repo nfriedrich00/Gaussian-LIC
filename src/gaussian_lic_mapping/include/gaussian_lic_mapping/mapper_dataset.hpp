@@ -29,6 +29,7 @@ struct CameraFrameRecord
   std::string image_name;
   int width{0};
   int height{0};
+  CameraIntrinsics intrinsics;
   cv::Mat image_rgb_float;
   cv::Mat depth_m_float;
   Eigen::Matrix3d r_wc{Eigen::Matrix3d::Identity()};

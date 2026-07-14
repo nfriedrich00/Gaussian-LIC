@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime_api.h>
 #include <opencv2/core.hpp>
 
 #include <NvInfer.h>
@@ -21,6 +22,8 @@ public:
 
   DepthCompleter(const DepthCompleter &) = delete;
   DepthCompleter & operator=(const DepthCompleter &) = delete;
+  DepthCompleter(DepthCompleter &&) = delete;
+  DepthCompleter & operator=(DepthCompleter &&) = delete;
 
   cv::Mat complete(const cv::Mat & rgb_image, const cv::Mat & sparse_depth_m);
 
@@ -41,6 +44,7 @@ private:
   };
 
   void init_engine(const std::string & engine_path);
+  void release_resources() noexcept;
   std::vector<char> read_file(const std::string & filename) const;
   void allocate_buffers();
   void assign_tensor_index(const std::string & name, int index, bool is_input);
@@ -53,8 +57,10 @@ private:
   std::unique_ptr<nvinfer1::IRuntime, InferDeleter> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine, InferDeleter> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext, InferDeleter> context_;
+  cudaStream_t stream_{nullptr};
   std::vector<void *> device_buffers_;
-  std::vector<std::vector<float>> host_buffers_;
+  std::vector<float *> host_buffers_;
+  std::vector<size_t> buffer_element_counts_;
   std::vector<std::string> tensor_names_;
   std::vector<int> input_indices_;
   int rgb_index_{0};

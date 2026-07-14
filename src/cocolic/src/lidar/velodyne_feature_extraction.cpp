@@ -26,13 +26,39 @@ using namespace std;
 namespace cocolic
 {
 
-  VelodyneFeatureExtraction::VelodyneFeatureExtraction(const YAML::Node &node)
+  VelodyneFeatureExtraction::VelodyneFeatureExtraction(
+      const YAML::Node &node, const rclcpp::Node::SharedPtr &ros_node)
       : fea_param_(LiDARFeatureParam(node["VLP16"]))
   {
     n_scan = node["VLP16"]["N_SCAN"].as<int>();
     horizon_scan = node["VLP16"]["Horizon_SCAN"].as<int>();
+    if (n_scan <= 0 || horizon_scan <= 0)
+      throw std::invalid_argument("VLP16 N_SCAN and Horizon_SCAN must be positive");
 
-    // ROS2 port: dropped debug-viz publisher advertises (NodeHandle removed).
+    ros_node_ = ros_node;
+    if (ros_node_)
+    {
+      if (ros_node_->has_parameter("lidar_frame"))
+        debug_frame_ = ros_node_->get_parameter("lidar_frame").as_string();
+      const std::string prefix = ros_node_->has_parameter("topic_prefix")
+                                     ? ros_node_->get_parameter("topic_prefix").as_string()
+                                     : std::string();
+      const auto topic = [&prefix](const std::string &suffix) {
+        if (prefix.empty()) return "/" + suffix;
+        std::string normalized = prefix;
+        if (normalized.front() != '/') normalized.insert(normalized.begin(), '/');
+        if (normalized.back() != '/') normalized.push_back('/');
+        return normalized + suffix;
+      };
+      pub_corner_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("lidar_feature/corner_cloud"), rclcpp::SensorDataQoS());
+      pub_surface_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("lidar_feature/surface_cloud"), rclcpp::SensorDataQoS());
+      pub_full_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("lidar_feature/full_cloud"), rclcpp::SensorDataQoS());
+      pub_feature_cloud_ = ros_node_->create_publisher<cocolic::msg::FeatureCloud>(
+          topic("lidar_feature/feature_cloud"), rclcpp::SensorDataQoS());
+    }
 
     AllocateMemory();
     ResetParameters();
@@ -57,9 +83,9 @@ namespace cocolic
 
     cloud_smoothness.resize(n_scan * horizon_scan);
 
-    cloud_curvature = new float[n_scan * horizon_scan];
-    cloud_neighbor_picked = new int[n_scan * horizon_scan];
-    cloud_label = new int[n_scan * horizon_scan];
+    cloud_curvature.assign(n_scan * horizon_scan, 0.0F);
+    cloud_neighbor_picked.assign(n_scan * horizon_scan, 0);
+    cloud_label.assign(n_scan * horizon_scan, 0);
 
     down_size_filter.SetResolution(fea_param_.odometry_surface_leaf_size);
   }
@@ -81,14 +107,23 @@ namespace cocolic
     if (!check_field_passed)
       return;
 
-    LidarHandler(cur_cloud);
+    const int64_t stamp_ns =
+        static_cast<int64_t>(lidar_msg->header.stamp.sec) * 1000000000LL +
+        static_cast<int64_t>(lidar_msg->header.stamp.nanosec);
+    LidarHandler(cur_cloud, stamp_ns);
   }
 
   void VelodyneFeatureExtraction::LidarHandler(
-      const RTPointCloud::Ptr raw_cloud)
+      const RTPointCloud::Ptr raw_cloud, int64_t stamp_ns)
   {
     p_corner_cloud.reset(new RTPointCloud());
     p_surface_cloud.reset(new RTPointCloud());
+
+    if (!raw_cloud || raw_cloud->empty())
+    {
+      ResetParameters();
+      return;
+    }
 
     if (raw_cloud->isOrganized())
       OrganizedCloudToRangeImage(raw_cloud, range_mat, p_full_cloud);
@@ -97,12 +132,14 @@ namespace cocolic
 
     // [range_mat] and [p_full_cloud] are ready.
     CloudExtraction();
-    CaculateSmoothness();
-    MarkOccludedPoints();
-    ExtractFeatures();
+    if (p_extracted_cloud->size() > 10U)
+    {
+      CaculateSmoothness();
+      MarkOccludedPoints();
+      ExtractFeatures();
+    }
+    PublishCloud(stamp_ns);
     ResetParameters();
-
-    PublishCloud("map");
   }
 
   bool VelodyneFeatureExtraction::CheckMsgFields(
@@ -131,30 +168,17 @@ namespace cocolic
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr &lidar_msg,
       RTPointCloud::Ptr out_cloud) const
   {
-    static bool has_checked = false;
-    static bool check_field_passed = false;
-    static bool has_t_field = false;
-    static bool has_time_field = false;
-    static bool has_timestamp_field = false;
-
-    /// Check ring channel and point time for the first msg
-    if (!has_checked)
-    {
-      has_checked = true;
-      bool has_ring_field = CheckMsgFields(*lidar_msg, "ring");
-      has_time_field = CheckMsgFields(*lidar_msg, "time");           // float s -> Velodyne: lvi、lio
-      has_t_field = CheckMsgFields(*lidar_msg, "t");                 // uint32_t ns -> Ouster: viral
-      has_timestamp_field = CheckMsgFields(*lidar_msg, "timestamp"); // float s -> Hesai-PandarQT
-
-      check_field_passed = has_ring_field && (has_time_field || has_t_field || has_timestamp_field);
-
-      // if (!has_ring_field)
-      //   LOG(WARNING) << "[ParsePointCloud] input cloud NOT has [ring] field";
-
-      // if (!has_time_field && !has_t_field && !has_timestamp_field)
-      //   LOG(WARNING)
-      //       << "[ParsePointCloud] input cloud NOT has [time] or [t] or [timestamp] field";
-    }
+    if (!out_cloud) return false;
+    out_cloud->clear();
+    if (!lidar_msg || lidar_msg->width == 0 ||
+        lidar_msg->height == 0 || lidar_msg->data.empty())
+      return false;
+    const bool has_ring_field = CheckMsgFields(*lidar_msg, "ring");
+    const bool has_time_field = CheckMsgFields(*lidar_msg, "time");
+    const bool has_t_field = CheckMsgFields(*lidar_msg, "t");
+    const bool has_timestamp_field = CheckMsgFields(*lidar_msg, "timestamp");
+    const bool check_field_passed =
+        has_ring_field && (has_time_field || has_t_field || has_timestamp_field);
 
     /// convert cloud
     if (check_field_passed)
@@ -184,13 +208,18 @@ namespace cocolic
         RTPointCloudTmp2RTPointCloudHesai(tmp_out_cloud, out_cloud);
       }
     }
-    return check_field_passed;
+    return check_field_passed && !out_cloud->empty();
   }
 
   bool VelodyneFeatureExtraction::ParsePointCloudNoFeature(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr &lidar_msg,
       RTPointCloud::Ptr out_cloud)
   {
+    if (!out_cloud) return false;
+    out_cloud->clear();
+    if (!lidar_msg || lidar_msg->width == 0 ||
+        lidar_msg->height == 0 || lidar_msg->data.empty())
+      return false;
     RTPointCloudTmp::Ptr tmp_out_cloud(new RTPointCloudTmp);
     pcl::fromROSMsg(*lidar_msg, *tmp_out_cloud);
 
@@ -228,6 +257,8 @@ namespace cocolic
         }
       }
     }
+
+    if (p_surface_cloud->empty()) return false;
 
     ///
     p_full_cloud->push_back((*p_surface_cloud)[0]);
@@ -271,8 +302,8 @@ namespace cocolic
       const RTPointCloud::Ptr cur_cloud, cv::Mat &dist_image,
       RTPointCloud::Ptr &corresponding_cloud) const
   {
-    static float angle_resolution = 360.0 / float(horizon_scan);
-    static float rad2deg = 180.0 / M_PI;
+    const float angle_resolution = 360.0F / static_cast<float>(horizon_scan);
+    constexpr float rad2deg = 180.0F / static_cast<float>(M_PI);
 
     for (const RTPoint &p : cur_cloud->points)
     {
@@ -330,6 +361,7 @@ namespace cocolic
 
   void VelodyneFeatureExtraction::CaculateSmoothness()
   {
+    if (p_extracted_cloud->points.size() <= 10U) return;
     for (size_t i = 5; i < p_extracted_cloud->points.size() - 5; i++)
     {
       float diff_range = point_range_list[i - 5] + point_range_list[i - 4] +
@@ -348,6 +380,7 @@ namespace cocolic
 
   void VelodyneFeatureExtraction::MarkOccludedPoints()
   {
+    if (p_extracted_cloud->points.size() <= 11U) return;
     for (size_t i = 5; i < p_extracted_cloud->points.size() - 6; i++)
     {
       float depth1 = point_range_list[i];
@@ -393,6 +426,9 @@ namespace cocolic
     RTPointCloud::Ptr surface_cloud_scan(new RTPointCloud());
     RTPointCloud::Ptr surface_cloud_scan_downsample(new RTPointCloud());
 
+    const int cloud_size = static_cast<int>(p_extracted_cloud->size());
+    if (cloud_size <= 10) return;
+
     for (int i = 0; i < n_scan; i++)
     {
       surface_cloud_scan->clear();
@@ -403,6 +439,8 @@ namespace cocolic
         int sp = (start_ring_index[i] * (6 - j) + end_ring_index[i] * j) / 6;
         int ep =
             (start_ring_index[i] * (5 - j) + end_ring_index[i] * (j + 1)) / 6 - 1;
+        sp = std::max(sp, 5);
+        ep = std::min(ep, cloud_size - 6);
         if (sp >= ep)
           continue;
         std::sort(cloud_smoothness.begin() + sp, cloud_smoothness.begin() + ep,
@@ -491,55 +529,34 @@ namespace cocolic
     }
   }
 
-  void VelodyneFeatureExtraction::PublishCloud(std::string frame_id)
+  void VelodyneFeatureExtraction::PublishCloud(int64_t stamp_ns)
   {
-    // ROS2 port: debug-viz publish is a no-op for offline replay.
-    (void)frame_id;
-    return;
-#if 0
-    bool pub_fea = (pub_full_cloud.getNumSubscribers() != 0);
-
-    cocolic::feature_cloud feature_msg;
-    if (pub_fea || pub_corner_cloud.getNumSubscribers() != 0)
+    if (!ros_node_) return;
+    const auto stamp = stamp_ns >= 0 ? rclcpp::Time(stamp_ns) : ros_node_->now();
+    sensor_msgs::msg::PointCloud2 corner_msg;
+    sensor_msgs::msg::PointCloud2 surface_msg;
+    sensor_msgs::msg::PointCloud2 full_msg;
+    pcl::toROSMsg(*p_corner_cloud, corner_msg);
+    pcl::toROSMsg(*p_surface_cloud, surface_msg);
+    pcl::toROSMsg(*p_full_cloud, full_msg);
+    corner_msg.header.stamp = stamp; corner_msg.header.frame_id = debug_frame_;
+    surface_msg.header.stamp = stamp; surface_msg.header.frame_id = debug_frame_;
+    full_msg.header.stamp = stamp; full_msg.header.frame_id = debug_frame_;
+    if (pub_corner_cloud_->get_subscription_count() != 0)
+      pub_corner_cloud_->publish(corner_msg);
+    if (pub_surface_cloud_->get_subscription_count() != 0)
+      pub_surface_cloud_->publish(surface_msg);
+    if (pub_full_cloud_->get_subscription_count() != 0)
+      pub_full_cloud_->publish(full_msg);
+    if (pub_feature_cloud_->get_subscription_count() != 0)
     {
-      sensor_msgs::PointCloud2 corner_msg;
-      pcl::toROSMsg(*p_corner_cloud, corner_msg);
-      corner_msg.header.stamp = ros::Time::now();
-      corner_msg.header.frame_id = frame_id;
-
-      pub_corner_cloud.publish(corner_msg);
-      feature_msg.corner_cloud = corner_msg;
+      cocolic::msg::FeatureCloud feature;
+      feature.header = corner_msg.header;
+      feature.corner_cloud = corner_msg;
+      feature.surface_cloud = surface_msg;
+      feature.full_cloud = full_msg;
+      pub_feature_cloud_->publish(feature);
     }
-    if (pub_fea || pub_surface_cloud.getNumSubscribers() != 0)
-    {
-      sensor_msgs::PointCloud2 surface_msg;
-      pcl::toROSMsg(*p_surface_cloud, surface_msg);
-      surface_msg.header.stamp = ros::Time::now();
-      surface_msg.header.frame_id = frame_id;
-
-      pub_surface_cloud.publish(surface_msg);
-      feature_msg.surface_cloud = surface_msg;
-    }
-
-    if (pub_fea || pub_full_cloud.getNumSubscribers() != 0)
-    {
-      sensor_msgs::PointCloud2 full_msg;
-      pcl::toROSMsg(*p_full_cloud, full_msg);
-      full_msg.header.stamp = ros::Time::now();
-      full_msg.header.frame_id = frame_id;
-
-      pub_full_cloud.publish(full_msg);
-      feature_msg.full_cloud = full_msg;
-    }
-
-    if (pub_fea)
-    {
-      feature_msg.header.stamp = ros::Time::now();
-      feature_msg.header.frame_id = frame_id;
-
-      pub_feature_cloud.publish(feature_msg);
-    }
-#endif
   }
 
 } // namespace cocolic

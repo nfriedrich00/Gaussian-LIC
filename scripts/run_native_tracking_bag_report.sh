@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+INSTALL_SETUP="${GAUSSIAN_LIC_INSTALL_SETUP:-${ROOT_DIR}/install/setup.bash}"
 BAG_PATH="/home/frank/data/fast_livo/Bright_Screen_Wall_frontend_raw"
 OUTPUT_DIR="${ROOT_DIR}/results/fastlivo2/Bright_Screen_Wall_native_tracking_12s"
 PLAYBACK_DURATION=12
@@ -192,6 +193,8 @@ ENABLE_VISUAL_PAIR_PROCESSING_DEFER_TO_POINTCLOUD=false
 ENABLE_MAPPER_FEEDBACK=false
 MAPPER_FEEDBACK_SYNC_TOLERANCE_SEC=0.05
 MAPPER_FEEDBACK_SYNC_ANCHOR_STREAM=pointcloud
+MAPPER_FEEDBACK_DEPTH_COMPLETION=false
+MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH=""
 ENABLE_GAUSSIAN_MAP_FEEDBACK=false
 REQUIRE_GAUSSIAN_SNAPSHOT=false
 MAPPER_FEEDBACK_RENDER_MODE="${MAPPER_FEEDBACK_RENDER_MODE:-debug_input}"
@@ -839,6 +842,10 @@ Options:
                                mapping_node frame sync tolerance for mapper feedback. Default: 0.05.
   --mapper-feedback-sync-anchor STREAM
                                mapping_node synchronization anchor stream for mapper feedback: pointcloud or image. Default: pointcloud.
+  --mapper-feedback-enable-depth-completion
+                               Enable TensorRT/SPNet depth completion in mapping_node. Requires --mapper-feedback-depth-completion-engine-path.
+  --mapper-feedback-depth-completion-engine-path FILE
+                               TensorRT/SPNet engine used by mapper feedback depth completion.
   --mapper-feedback-image-qos-reliability MODE
                                mapping_node image input QoS reliability for mapper feedback. Default: best_effort. Use only with a compatible rosbag/player QoS override.
   --mapper-feedback-image-qos-depth N
@@ -2046,6 +2053,14 @@ while [[ $# -gt 0 ]]; do
       MAPPER_FEEDBACK_SYNC_ANCHOR_STREAM="$2"
       shift 2
       ;;
+    --mapper-feedback-enable-depth-completion)
+      MAPPER_FEEDBACK_DEPTH_COMPLETION=true
+      shift
+      ;;
+    --mapper-feedback-depth-completion-engine-path)
+      MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH="$2"
+      shift 2
+      ;;
     --mapper-feedback-image-qos-reliability)
       MAPPER_FEEDBACK_IMAGE_QOS_RELIABILITY="$2"
       MAPPER_FEEDBACK_IMAGE_QOS_RELIABILITY_EXPLICIT=true
@@ -2550,6 +2565,21 @@ case "${MAPPER_FEEDBACK_IMAGE_QOS_RELIABILITY}" in
     ;;
 esac
 
+if [[ "${MAPPER_FEEDBACK_DEPTH_COMPLETION}" == "true" ]]; then
+  if [[ "${ENABLE_MAPPER_FEEDBACK}" != "true" ]]; then
+    echo "--mapper-feedback-enable-depth-completion requires --enable-mapper-feedback or --enable-gaussian-map-feedback" >&2
+    exit 2
+  fi
+  if [[ -z "${MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH}" ]]; then
+    echo "--mapper-feedback-enable-depth-completion requires --mapper-feedback-depth-completion-engine-path" >&2
+    exit 2
+  fi
+  if [[ ! -r "${MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH}" ]]; then
+    echo "TensorRT/SPNet engine is not readable: ${MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH}" >&2
+    exit 2
+  fi
+fi
+
 case "${SLIDING_WINDOW_RELATIVE_MOTION_HISTORY_SOURCE}" in
   pre_ba|published|published_after_warmup)
     ;;
@@ -2587,9 +2617,13 @@ elif [[ -z "${ROS_DOMAIN_ID:-}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
+if [[ ! -r "${INSTALL_SETUP}" ]]; then
+  echo "ROS2 install setup is not readable: ${INSTALL_SETUP}" >&2
+  exit 2
+fi
 set +u
 source "/opt/ros/${ROS_DISTRO}/setup.bash"
-source install/setup.bash
+source "${INSTALL_SETUP}"
 set -u
 
 OUTPUT_DIR="$(realpath -m "${OUTPUT_DIR}")"
@@ -2640,10 +2674,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+deterministic_launch_args=()
+if [[ -n "${DETERMINISTIC_FEEDBACK_BAG:-}" ]]; then
+  deterministic_launch_args=(
+    "deterministic_bag_path:=${BAG_PATH}"
+    "deterministic_feedback_bag_path:=${DETERMINISTIC_FEEDBACK_BAG}"
+    "output_tum_path:=${OUTPUT_DIR}/deterministic_trajectory.tum"
+  )
+fi
+
 setsid ros2 launch gaussian_lic_bringup tracking.launch.py \
-  deterministic_bag_path:="${DETERMINISTIC_FEEDBACK_BAG:+${BAG_PATH}}" \
-  deterministic_feedback_bag_path:="${DETERMINISTIC_FEEDBACK_BAG:-}" \
-  output_tum_path:="${DETERMINISTIC_FEEDBACK_BAG:+${OUTPUT_DIR}/deterministic_trajectory.tum}" \
+  "${deterministic_launch_args[@]}" \
   enable_sliding_window_optimizer:=true \
   enable_sliding_window_gravity_estimation:="${ENABLE_SLIDING_WINDOW_GRAVITY_ESTIMATION:-false}" \
   sliding_window_gravity_estimation_prior_weight:="${SLIDING_WINDOW_GRAVITY_ESTIMATION_PRIOR_WEIGHT:-1.0}" \
@@ -2907,7 +2948,17 @@ launch_pid=$!
 # (incl imu_linear_acceleration_scale, step guards, sliding-window weights).
 if [[ -n "${DETERMINISTIC_FEEDBACK_BAG:-}" ]]; then
   echo "deterministic replay: waiting for tracking_node to finish reading bags (sensor=${BAG_PATH}, feedback=${DETERMINISTIC_FEEDBACK_BAG})..."
-  wait "${launch_pid}" 2>/dev/null || true
+  if wait "${launch_pid}" 2>/dev/null; then
+    deterministic_launch_exit=0
+  else
+    deterministic_launch_exit=$?
+  fi
+  unset launch_pid
+  if (( deterministic_launch_exit != 0 )); then
+    echo "deterministic replay FAIL: tracking launch exited with code ${deterministic_launch_exit}"
+    tail -40 "${launch_log}" 2>/dev/null || true
+    exit "${deterministic_launch_exit}"
+  fi
   det_tum="${OUTPUT_DIR}/deterministic_trajectory.tum"
   if [[ ! -s "${det_tum}" ]]; then
     echo "deterministic replay FAIL: TUM ${det_tum} missing/empty"
@@ -2925,6 +2976,14 @@ if [[ -n "${DETERMINISTIC_FEEDBACK_BAG:-}" ]]; then
     cat "${OUTPUT_DIR}/deterministic_trajectory_compare.txt" 2>/dev/null || true
   fi
   exit 0
+fi
+
+mapper_depth_completion_args=()
+if [[ "${MAPPER_FEEDBACK_DEPTH_COMPLETION}" == "true" ]]; then
+  mapper_depth_completion_args=(
+    -p depth_completion:=true
+    -p "depth_completion_engine_path:=${MAPPER_FEEDBACK_DEPTH_COMPLETION_ENGINE_PATH}"
+  )
 fi
 
 if [[ "${ENABLE_MAPPER_FEEDBACK}" == "true" ]]; then
@@ -2962,6 +3021,7 @@ if [[ "${ENABLE_MAPPER_FEEDBACK}" == "true" ]]; then
     -p sync_anchor_stream:="${MAPPER_FEEDBACK_SYNC_ANCHOR_STREAM}" \
     -p select_every_k_frame:="${MAPPER_FEEDBACK_SELECT_EVERY_K_FRAME}" \
     -p require_depth_topic:=false \
+    "${mapper_depth_completion_args[@]}" \
     -p publish_gaussian_map:="${MAPPER_FEEDBACK_PUBLISH_GAUSSIAN_MAP}" \
     -p gaussian_map_chunk_size:="${MAPPER_FEEDBACK_GAUSSIAN_MAP_CHUNK_SIZE}" \
     -p gaussian_map_qos_depth:="${MAPPER_FEEDBACK_GAUSSIAN_MAP_QOS_DEPTH}" \

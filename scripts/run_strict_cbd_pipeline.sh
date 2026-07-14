@@ -371,6 +371,8 @@ if [[ "${SKIP_REPORT}" != "true" ]]; then
       QUALITY_PYTHON="${HOME}/.cache/gaussian_lic_ros2/quality-cuda-venv/bin/python"
     elif [[ -x "${HOME}/.cache/gaussian_lic_ros2/quality-venv/bin/python" ]]; then
       QUALITY_PYTHON="${HOME}/.cache/gaussian_lic_ros2/quality-venv/bin/python"
+    elif [[ -x "${HOME}/miniconda3/envs/active-gs-original/bin/python" ]]; then
+      QUALITY_PYTHON="${HOME}/miniconda3/envs/active-gs-original/bin/python"
     else
       QUALITY_PYTHON="/usr/bin/python3"
     fi

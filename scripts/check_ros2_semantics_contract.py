@@ -14,7 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "src" / "gaussian_lic_bringup" / "config"
 MAPPING_NODE = ROOT / "src" / "gaussian_lic_mapping" / "src" / "mapping_node.cpp"
 FRONTEND_ADAPTER = ROOT / "src" / "gaussian_lic_frontend" / "src" / "lic2_contract_adapter_node.cpp"
+LIVOX_CUSTOM_BRIDGE = (
+    ROOT
+    / "src"
+    / "gaussian_lic_frontend"
+    / "scripts"
+    / "livox_custom_to_pointcloud2.py"
+)
 RUN_BAG_LAUNCH = ROOT / "src" / "gaussian_lic_bringup" / "launch" / "run_bag.launch.py"
+PROFILE_PARAMETERS = (
+    ROOT
+    / "src"
+    / "gaussian_lic_bringup"
+    / "gaussian_lic_bringup"
+    / "profile_parameters.py"
+)
 TRACKING_LAUNCH = ROOT / "src" / "gaussian_lic_bringup" / "launch" / "tracking.launch.py"
 TRACKING_NODE = ROOT / "src" / "gaussian_lic_tracking" / "src" / "tracking_node.cpp"
 SLIDING_WINDOW_OPTIMIZER = ROOT / "src" / "gaussian_lic_tracking" / "src" / "sliding_window_optimizer.cpp"
@@ -71,7 +85,9 @@ def main() -> int:
 
     mapping_text = read(MAPPING_NODE)
     frontend_text = read(FRONTEND_ADAPTER)
+    livox_bridge_text = read(LIVOX_CUSTOM_BRIDGE)
     launch_text = read(RUN_BAG_LAUNCH)
+    profile_parameters_text = read(PROFILE_PARAMETERS)
     tracking_launch_text = read(TRACKING_LAUNCH)
     tracking_node_text = read(TRACKING_NODE)
     sliding_window_text = read(SLIDING_WINDOW_OPTIMIZER)
@@ -90,6 +106,10 @@ def main() -> int:
         errors.append("CI workflow must stay Jazzy-only; do not add ROS2 Humble to the build matrix")
     if "ros_distro: [jazzy]" not in ci_workflow_text:
         errors.append("CI workflow build matrix must be exactly ros_distro: [jazzy]")
+    if "colcon test --packages-select" in ci_workflow_text:
+        errors.append("CI must run the full workspace test suite, not a single package")
+    if "build_ros2.sh --cpu-only" not in ci_workflow_text:
+        errors.append("CI must exercise the explicit CPU-only build profile")
 
     if "stamp_to_sec" in mapping_text:
         errors.append("mapping_node still exposes stamp_to_sec; use int64 nanoseconds for sync math")
@@ -143,16 +163,72 @@ def main() -> int:
         if f'declare_topic_qos("{stream}")' not in frontend_text:
             errors.append(f"lic2_contract_adapter must declare per-stream QoS for {stream}")
 
-    if 'executable="component_container_mt"' in launch_text or "component_container_mt" in launch_text:
-        errors.append("run_bag.launch.py must default strict composition to single-threaded component_container")
-    if 'executable="component_container"' not in launch_text:
-        errors.append("run_bag.launch.py does not use the single-threaded component_container")
-    if '"--clock"' not in launch_text:
+    if 'executable="component_container_mt"' not in launch_text:
+        errors.append("run_bag.launch.py must allow sensor callbacks and GPU work to overlap")
+    if '"--clock"' not in profile_parameters_text:
         errors.append("run_bag.launch.py rosbag2 replay must publish /clock")
-    if '"--read-ahead-queue-size", "100"' not in launch_text:
+    if '"--read-ahead-queue-size", "100"' not in profile_parameters_text:
         errors.append("run_bag.launch.py strict replay must use bounded read-ahead queue size 100")
-    if '"use_sim_time", default_value="true"' not in launch_text:
-        errors.append("run_bag.launch.py must default use_sim_time to true")
+    if 'default_value=play_bag' not in launch_text:
+        errors.append("run_bag.launch.py must default use_sim_time to play_bag")
+    if 'effective_adapter_raw_pointcloud_topic' not in launch_text:
+        errors.append("run_bag.launch.py must route the adapter through the Livox bridge output")
+    if "TimerAction(" not in launch_text or "period=2.0" not in launch_text:
+        errors.append("run_bag.launch.py must delay rosbag playback until nodes have started")
+    if '"stub_mode",\n            default_value="false"' not in launch_text:
+        errors.append("run_bag.launch.py must start the native mapper by default")
+    if "_resolve_profile_and_coordinates" not in launch_text or \
+            "PROFILE_INHERIT_SENTINEL" not in launch_text:
+        errors.append("run_bag.launch.py must preserve selected mapping profile values")
+    if '"pointcloud_coordinates": resolved_pointcloud_coordinates' not in launch_text or \
+            "resolve_pointcloud_coordinates" not in launch_text:
+        errors.append("run_bag.launch.py must resolve auto/world/sensor pointcloud coordinates")
+    if "POINT_STEP = 20" not in livox_bridge_text:
+        errors.append("Livox CustomMsg bridge must preserve the 20-byte timed point layout")
+    if 'PointField(name="offset_time", offset=16, datatype=PointField.UINT32' not in livox_bridge_text:
+        errors.append("Livox CustomMsg bridge must publish UINT32 offset_time at byte 16")
+    if "declared_count != len(points)" not in livox_bridge_text:
+        errors.append("Livox CustomMsg bridge must reject corrupt point_num/points mismatches")
+    if "time_from_timebase_ns(msg.timebase)" not in livox_bridge_text:
+        errors.append("Livox CustomMsg bridge must derive the cloud stamp from packet timebase")
+    if "MAX_POINT_COUNT = 0xFFFFFFFF // POINT_STEP" not in livox_bridge_text:
+        errors.append("Livox CustomMsg bridge must guard PointCloud2 row_step overflow")
+    if "_validate_runtime_backend" not in launch_text:
+        errors.append("run_bag.launch.py must fail fast when rasterizer lacks a CUDA build")
+    if '"depth_completion": depth_completion' not in launch_text or \
+            '"depth_completion_engine_path": depth_completion_engine_path' not in launch_text:
+        errors.append("run_bag.launch.py must expose SPNet enable/engine overrides")
+    if 'capabilities.get("tensorrt", False)' not in launch_text or \
+            "depth_completion_engine_path is not a regular file" not in launch_text:
+        errors.append("run_bag.launch.py must fail fast when required SPNet runtime is unavailable")
+    if "depth_completion=true requires a build with" not in mapping_text or \
+            "resolve_depth_completion_engine_path" not in mapping_text:
+        errors.append("mapping_node must reject silent SPNet fallback and resolve external engines")
+    if "required TensorRT depth completion failed; stopping" not in mapping_text or \
+            "DepthCompletionFatalError" not in mapping_text:
+        errors.append("mapping_node must stop on required SPNet inference failure")
+    if "mapping node terminated after a required pipeline failure" not in mapping_text or \
+            "return 1;" not in mapping_text:
+        errors.append("standalone mapping_node must return nonzero after a required pipeline failure")
+    if "resolve_lpips_model_path" not in mapping_text or \
+            "final Gaussian save/evaluation was requested" not in mapping_text:
+        errors.append("mapping_node must require LPIPS and an initialized Gaussian map for parity saves")
+    if 'output_dir / "render"' not in mapping_text or \
+            "remove_evaluation_artifact" not in mapping_text:
+        errors.append("final evaluation must provide upstream render/ compatibility and remove stale frames")
+    for auto_finalize_arg in (
+        "auto_finalize_on_inactivity",
+        "auto_finalize_inactivity_sec",
+        "auto_finalize_output_path",
+        "auto_finalize_include_skybox",
+        "auto_finalize_exit",
+    ):
+        if f'"{auto_finalize_arg}"' not in launch_text:
+            errors.append(f"run_bag.launch.py must expose {auto_finalize_arg}")
+    if '"enable_non_upstream_density_control"' not in launch_text:
+        errors.append("run_bag.launch.py must expose the non-upstream density-control gate")
+    if '"lpips_model_path": lpips_model_path' not in launch_text:
+        errors.append("run_bag.launch.py must forward lpips_model_path to the mapper")
     if "global_time_regressions" not in timing_audit_text or "strict-storage" not in timing_audit_text:
         errors.append("rosbag2_timing_audit.py must check timestamp regressions and strict storage mode")
     if "header_stamp_regressions" not in timing_audit_text or "rosbag2_py.SequentialReader" not in timing_audit_text:
@@ -812,7 +888,8 @@ def main() -> int:
     if "--mapper-feedback-sync-anchor" not in native_tracking_report_text or \
             "mapper_feedback_sync_anchor_stream" not in native_tracking_report_text:
         errors.append("native tracking real-bag report must expose and record the mapper feedback sync anchor")
-    if '"sync_anchor_stream"' not in launch_text or 'default_value="pointcloud"' not in launch_text:
+    if '"sync_anchor_stream"' not in launch_text or \
+            '"sync_anchor_stream": "pointcloud"' not in profile_parameters_text:
         errors.append("run_bag.launch.py must expose mapper sync_anchor_stream with pointcloud default")
     if "++rendered_preview_count_" not in mapping_text:
         errors.append("mapping_node must count successful rendered preview publications")

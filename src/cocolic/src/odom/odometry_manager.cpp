@@ -16,20 +16,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// ROS2 port: dropped <eigen_conversions/eigen_msg.h> (ROS1; its tf::*EigenToMsg
-// users live in the stubbed viewer / #if 0'd camera-viz blocks).
 #include <odom/odometry_manager.h>
+#include <odom/imu_window_statistics.h>
+#include <utils/config_path.h>
+#include <utils/yaml_utils.h>
 #include <numeric>
+#include <cmath>
 
 #include <fstream>
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <stdexcept>
 #include <filesystem>  // ROS2 port: std::filesystem (was boost::filesystem)
-#include <cstring>     // GL2: memcpy for for_gs PointCloud2 packing
-#include <chrono>     // GL2: lockstep pacing timing
-#include <thread>     // GL2: sleep_for in lockstep pacing
-#include <opencv2/imgproc.hpp>  // GL2: cv::cvtColor for render-photometric
+#include <cstring>     // ROS2 mapper: memcpy for for_gs PointCloud2 packing
+#include <chrono>     // ROS2 mapper: lockstep pacing timing
+#include <thread>     // ROS2 mapper: sleep_for in lockstep pacing
+#include <opencv2/imgproc.hpp>  // ROS2 mapper: cv::cvtColor for render-photometric
 
 std::fstream rgb_file;
 std::fstream img_file;
@@ -37,21 +40,26 @@ std::fstream img_file;
 namespace cocolic
 {
 
-  OdometryManager::OdometryManager(const YAML::Node &node)
+  OdometryManager::OdometryManager(
+      const YAML::Node &node, const std::string &config_directory,
+      const rclcpp::Node::SharedPtr &ros_node,
+      const std::string &output_directory)
       : odometry_mode_(LIO), is_initialized_(false)
   {
-    // ROS2 port: project_path was a ROS param; now read from the config yaml.
-    std::string config_path =
-        node["project_path"] ? node["project_path"].as<std::string>() : "";
-    config_path += "/config";
+    // Resolve referenced sensor YAMLs relative to the main configuration file.
+    // This is independent of cwd and works identically from source and install.
+    const std::string config_path = config_directory;
 
     std::string lidar_yaml = node["lidar_yaml"].as<std::string>();
-    YAML::Node lidar_node = YAML::LoadFile(config_path + lidar_yaml);
+    YAML::Node lidar_node = YAML::LoadFile(ResolveConfigPath(config_path, lidar_yaml));
+    const int num_lidars =
+        yaml::RequirePositive<int>(lidar_node, "num_lidars", "lidar");
 
     std::string imu_yaml = node["imu_yaml"].as<std::string>();
-    YAML::Node imu_node = YAML::LoadFile(config_path + imu_yaml);
+    YAML::Node imu_node = YAML::LoadFile(ResolveConfigPath(config_path, imu_yaml));
 
-    std::string cam_yaml = config_path + node["camera_yaml"].as<std::string>();
+    std::string cam_yaml =
+        ResolveConfigPath(config_path, node["camera_yaml"].as<std::string>());
     YAML::Node cam_node = YAML::LoadFile(cam_yaml);
 
     odometry_mode_ = OdometryMode(node["odometry_mode"].as<int>());
@@ -70,7 +78,7 @@ namespace cocolic
     EP_LtoI.Init(lidar_node["lidar0"]["Extrinsics"]);
     if (odometry_mode_ == LICO)
       EP_CtoI.Init(cam_node["CameraExtrinsics"]);
-    if (node["IMUExtrinsics"])
+    if (imu_node["IMUExtrinsics"])
       EP_ItoI.Init(imu_node["IMUExtrinsics"]);
     EP_MtoI.Init(imu_node["MarkerExtrinsics"]);
 
@@ -81,16 +89,16 @@ namespace cocolic
     trajectory_->SetSensorExtrinsics(SensorType::Marker, EP_MtoI);
 
     // non-uniform b-spline
-    t_add_ = node["t_add"].as<double>();
+    t_add_ = yaml::RequirePositive<double>(node, "t_add", "odometry");
     t_add_ns_ = t_add_ * S_TO_NS;
     non_uniform_ = node["non_uniform"].as<bool>();
     distance0_ = node["distance0"].as<double>();
 
     // lidar
-    lidar_iter_ = node["lidar_iter"].as<int>();
+    lidar_iter_ = yaml::RequirePositive<int>(node, "lidar_iter", "odometry");
     use_lidar_scale_ = node["use_lidar_scale"].as<bool>();
     lidar_handler_ = std::make_shared<LidarHandler>(lidar_node, trajectory_);
-    std::cout << "\n🍺 The number of multiple LiDARs is " << lidar_node["num_lidars"].as<int>() << "." << std::endl;
+    std::cout << "\n🍺 The number of multiple LiDARs is " << num_lidars << "." << std::endl;
 
     // imu
     imu_initializer_ = std::make_shared<IMUInitializer>(imu_node);
@@ -114,13 +122,29 @@ namespace cocolic
     trajectory_manager_->use_lidar_scale = use_lidar_scale_;
     trajectory_manager_->SetIntrinsic(K_);
 
-    int division_coarse = node["division_coarse"].as<int>();
+    const int division_coarse =
+        yaml::RequirePositive<int>(node, "division_coarse", "odometry");
     cp_add_num_coarse_ = division_coarse;
     trajectory_manager_->SetDivisionParam(division_coarse, -1);
 
-    odom_viewer_.SetPublisher();  // ROS2 port: stub no-op
+    odom_viewer_.SetPublisher(ros_node);
+    world_frame_ = ros_node->get_parameter("world_frame").as_string();
+    image_frame_ = ros_node->get_parameter("image_frame").as_string();
+    const auto declare_topic = [&](const std::string &name,
+                                   const std::string &default_value) {
+      if (!ros_node->has_parameter(name))
+        return ros_node->declare_parameter<std::string>(name, default_value);
+      return ros_node->get_parameter(name).as_string();
+    };
+    gs_image_topic_ = declare_topic("gs_image_topic", gs_image_topic_);
+    gs_depth_topic_ = declare_topic("gs_depth_topic", gs_depth_topic_);
+    gs_camera_info_topic_ = declare_topic("gs_camera_info_topic", gs_camera_info_topic_);
+    gs_pose_topic_ = declare_topic("gs_pose_topic", gs_pose_topic_);
+    gs_points_topic_ = declare_topic("gs_points_topic", gs_points_topic_);
+    rendered_feedback_topic_ =
+        declare_topic("rendered_feedback_topic", rendered_feedback_topic_);
 
-    msg_manager_ = std::make_shared<MsgManager>(node, config_path);  // load rosbag
+    msg_manager_ = std::make_shared<MsgManager>(node, config_path, ros_node);
 
     // ROS2 port: pasue_time/verbose were ROS params → read from yaml or default.
     pasue_time_ = node["pasue_time"] ? node["pasue_time"].as<double>() : -1.0;
@@ -129,25 +153,27 @@ namespace cocolic
 
     // evaluation
     is_evo_viral_ = node["is_evo_viral"].as<bool>();
-    CreateCacheFolder(config_path, msg_manager_->bag_path_);
+    CreateCacheFolder(output_directory, msg_manager_->bag_path_);
 
     // gaussian-lic
     if_3dgs_ = node["if_3dgs"].as<bool>();
     lidar_skip_ = node["lidar_skip"].as<int>();
-    // GL2 step-2: when true, publish /*_for_gs live to a concurrent mapper
+    if (lidar_skip_ <= 0)
+      throw std::invalid_argument("lidar_skip must be greater than zero");
+    // Mapper-feedback: when true, publish /*_for_gs live to a concurrent mapper
     // (tight coupling) instead of writing the offline mapper_contract bag.
     gs_live_publish_ = node["gs_live_publish"] ? node["gs_live_publish"].as<bool>() : false;
-    // GL2 lockstep pacing (OQ4 fix): pace track A to mapper feedback throughput.
+    // Mapper lockstep pacing (OQ4 fix): pace Coco-LIC to mapper feedback throughput.
     gs_lockstep_ = node["gs_lockstep"] ? node["gs_lockstep"].as<bool>() : false;
     if (node["gs_lockstep_max_lag_s"])
       gs_lockstep_max_lag_ns_ = (int64_t)(node["gs_lockstep_max_lag_s"].as<double>() * 1e9);
     if (node["gs_lockstep_timeout_s"])
       gs_lockstep_timeout_ms_ = (int64_t)(node["gs_lockstep_timeout_s"].as<double>() * 1e3);
-    // GL2 step-2c: render-photometric coupling (rendered map → track A pose factor).
+    // Render-photometric: render-photometric coupling (rendered map -> Coco-LIC pose factor).
     enable_render_photometric_ = node["enable_render_photometric"] ? node["enable_render_photometric"].as<bool>() : false;
     if (node["render_photo_weight"]) rp_weight_ = node["render_photo_weight"].as<double>();
     if (node["render_photo_patch_half"]) rp_patch_half_ = node["render_photo_patch_half"].as<int>();
-    // GL2 demo: time-windowed LiDAR degradation (good -> bad -> good) for an asymmetric
+    // Diagnostic: time-windowed LiDAR degradation (good -> bad -> good) for an asymmetric
     // scenario where the good-segment map independently corrects the degraded segment.
     if (node["lidar_degrade_window_start_s"] && node["lidar_degrade_window_end_s"])
     {
@@ -155,7 +181,7 @@ namespace cocolic
       double de = node["lidar_degrade_window_end_s"].as<double>();
       double df = node["lidar_degrade_factor"] ? node["lidar_degrade_factor"].as<double>() : 1.0;
       trajectory_manager_->SetLidarDegradeWindow(ds, de, df);
-      std::cout << "\n[GL2] LiDAR degrade window [" << ds << "," << de << ")s factor " << df << "\n";
+      std::cout << "\n[cocolic_ros2] LiDAR degrade window [" << ds << "," << de << ")s factor " << df << "\n";
     }
     lidarpoints.clear();
 
@@ -163,7 +189,7 @@ namespace cocolic
     // LOG(INFO) << std::fixed << std::setprecision(4);
   }
 
-  bool OdometryManager::CreateCacheFolder(const std::string &config_path,
+  bool OdometryManager::CreateCacheFolder(const std::string &output_directory,
                                           const std::string &bag_path)
   {
     // ROS2 port: boost::filesystem → std::filesystem (C++17). Relaxed the
@@ -171,16 +197,18 @@ namespace cocolic
     // run name from the path's final component (filename, or stem if it has an
     // extension) and create the cache dir.
     namespace fs = std::filesystem;
-    fs::path path_cfg(config_path);
     fs::path path_bag(bag_path);
     std::string bag_name_ = path_bag.has_extension() ? path_bag.stem().string()
                                                      : path_bag.filename().string();
     if (bag_name_.empty()) bag_name_ = "run";
 
-    std::string cache_path_parent_ = path_cfg.parent_path().string();
-    cache_path_ = cache_path_parent_ + "/data/" + bag_name_;
+    const fs::path output_root = fs::absolute(output_directory).lexically_normal();
+    cache_path_ = (output_root / bag_name_).string();
     std::error_code ec;
-    fs::create_directories(cache_path_parent_ + "/data", ec);
+    fs::create_directories(output_root, ec);
+    if (ec)
+      throw std::runtime_error("Unable to create output directory '" +
+                               output_root.string() + "': " + ec.message());
     return true;
   }
 
@@ -197,7 +225,7 @@ namespace cocolic
         break;
       }
 
-      /// GL2 step-2bc: drain rendered_feedback from the concurrent mapper (no-op
+      /// Mapper-feedback: drain rendered_feedback from the concurrent mapper (no-op
       /// until gs_node_ exists, i.e. gs_live_publish mode after first image frame).
       SpinForGsFeedback();
 
@@ -223,17 +251,15 @@ namespace cocolic
       }
 
       /// [3] prepare data for the latest time interval delta_t
-      static bool is_two_seg_prepared = false;
-      static int seg_msg_cnt = 0;
-      if (!is_two_seg_prepared)
+      if (!is_two_seg_prepared_)
       {
-        if (PrepareTwoSegMsgs(seg_msg_cnt))  // prepare interval0 and interval1
+        if (PrepareTwoSegMsgs(seg_msg_cnt_))  // prepare interval0 and interval1
         {
-          seg_msg_cnt++;
+          seg_msg_cnt_++;
         }
-        if (seg_msg_cnt == 2)  // if interval0 and interval1 are ready
+        if (seg_msg_cnt_ == 2)  // if interval0 and interval1 are ready
         {
-          is_two_seg_prepared = true;
+          is_two_seg_prepared_ = true;
           UpdateTwoSeg();
           trajectory_->InitBlendMat();  // blending matrix is computed by knots of b-spline
         }
@@ -284,20 +310,23 @@ namespace cocolic
       }
     }
 
-    // GL2 step-1: flush + close the mapper_contract writer before shutdown —
+    // Mapper-contract: flush + close the mapper_contract writer before shutdown —
     // rosbag2's cache-consumer thread must be joined or std::terminate fires.
     if (forgs_open_)
     {
       forgs_writer_->close();
       forgs_writer_.reset();
       forgs_open_ = false;
-      std::cout << "[GL2] mapper_contract bag closed.\n";
+      std::cout << "[cocolic_ros2] mapper_contract bag closed.\n";
     }
+    // Report ingest diagnostics once after the finite bag has been drained.
+    // Calling this from every LiDAR solve floods offline runs when a sensor
+    // intentionally leaves IMU orientation unset.
+    msg_manager_->LogInfo();
   }
 
   void OdometryManager::SolveLICO()
   {
-    msg_manager_->LogInfo();
     if (msg_manager_->cur_msgs.lidar_timestamp < 0)
     {
       // LOG(INFO) << "CANT SolveLICO!";
@@ -365,7 +394,6 @@ namespace cocolic
         px_obss_.push_back(Eigen::Vector2d(it->second.x, it->second.y));
       }
 
-#if 0  // ROS2 port: viz only (ROS1 cv_bridge / ros::Time::now)
       if (odom_viewer_.pub_track_img_.getNumSubscribers() != 0 || odom_viewer_.pub_sub_visual_map_.getNumSubscribers() != 0)
       {
         cv::Mat img_debug = camera_handler_->img_pose_->m_img.clone();
@@ -385,17 +413,17 @@ namespace cocolic
         }
 
         cv_bridge::CvImage out_msg;
-        out_msg.header.stamp = ros::Time::now();
+        out_msg.header.stamp = rclcpp::Time(
+            msg.image_timestamp + trajectory_->GetDataStartTime());
         out_msg.encoding = sensor_msgs::image_encodings::BGR8;
         out_msg.image = img_debug;
         odom_viewer_.PublishTrackImg(out_msg.toImageMsg());
         odom_viewer_.PublishSubVisualMap(visual_sub_map_debug);
       }
-#endif
     }
 
     /// [5] finely optimize trajectory based on prior、lidar、imu、camera
-    // GL2 step-2c: build render-photometric reference once per frame (used in all iters).
+    // Render-photometric: build render-photometric reference once per frame (used in all iters).
     if (process_image)
       BuildRenderPhotometric();
     for (int iter = 0; iter < lidar_iter_; ++iter)
@@ -434,7 +462,6 @@ namespace cocolic
       SE3d Twc = trajectory_->GetCameraPoseNURBS(msg.image_timestamp);
       camera_handler_->AssociateNewPointsToCurrentImg(Twc.unit_quaternion(), Twc.translation());
 
-#if 0  // ROS2 port: viz only (ROS1 cv_bridge / ros::Time::now)
       if (odom_viewer_.pub_undistort_scan_in_cur_img_.getNumSubscribers() != 0)
       {
         cv::Mat img_debug = camera_handler_->img_pose_->m_img.clone();
@@ -447,11 +474,17 @@ namespace cocolic
             Eigen::Vector3d twc = Twc.translation();
             Eigen::Vector3d pt_cam = Rwc.transpose() * pt_e - Rwc.transpose() * twc;
             double X = pt_cam.x(), Y = pt_cam.y(), Z = pt_cam.z();
+            if (!std::isfinite(Z) || Z <= 1e-6) continue;
             cv::Point2f pix(K_(0, 0) * X / Z + K_(0, 2), K_(1, 1) * Y / Z + K_(1, 2));
+            if (!std::isfinite(pix.x) || !std::isfinite(pix.y) ||
+                pix.x < 0 || pix.x >= img_debug.cols ||
+                pix.y < 0 || pix.y >= img_debug.rows)
+              continue;
             cv::circle(img_debug, pix, 2, cv::Scalar(0, 0, 255), -1, 8);
           }
           cv_bridge::CvImage out_msg;
-          out_msg.header.stamp = ros::Time::now();
+          out_msg.header.stamp = rclcpp::Time(
+              msg.image_timestamp + trajectory_->GetDataStartTime());
           out_msg.encoding = sensor_msgs::image_encodings::BGR8;
           out_msg.image = img_debug;
           odom_viewer_.PublishUndistortScanInCurImg(out_msg.toImageMsg());
@@ -469,15 +502,15 @@ namespace cocolic
         }
 
         cv_bridge::CvImage out_msg;
-        out_msg.header.stamp = ros::Time::now();
+        out_msg.header.stamp = rclcpp::Time(
+            msg.image_timestamp + trajectory_->GetDataStartTime());
         out_msg.encoding = sensor_msgs::image_encodings::BGR8;
         out_msg.image = img_debug;
         odom_viewer_.PublishOldAndNewAddedPointsInCurImg(out_msg.toImageMsg());
       }
-#endif
     }
 
-    /// [new] for Gaussian-LIC (camera/3DGS — GL2 step-1 mapper contract)
+    /// [new] camera/3DGS mapper-contract interface.
     if (process_image && if_3dgs_)
     {
       Publish3DGSMappingData(msg);
@@ -567,34 +600,16 @@ namespace cocolic
     /// update the first seg
     {
       int cp_add_num = cp_add_num_coarse_;
-      Eigen::Vector3d aver_r = Eigen::Vector3d::Zero(), aver_a = Eigen::Vector3d::Zero();
-      double var_r = 0, var_a = 0;
-      int cnt = 0;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < trajectory_->maxTimeNsNURBS() ||
-            imu_datas[i].timestamp >= traj_max_time_ns_cur)
-          continue;
-        cnt++;
-        aver_r += imu_datas[i].gyro;
-        aver_a += imu_datas[i].accel;
-      }
-      aver_r /= cnt;
-      aver_a /= cnt;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < trajectory_->maxTimeNURBS() ||
-            imu_datas[i].timestamp >= traj_max_time_ns_cur)
-          continue;
-        var_r += (imu_datas[i].gyro - aver_r).transpose() * (imu_datas[i].gyro - aver_r);
-        var_a += (imu_datas[i].accel - aver_a).transpose() * (imu_datas[i].accel - aver_a);
-      }
-      var_r = sqrt(var_r / (cnt - 1));
-      var_a = sqrt(var_a / (cnt - 1));
+      const auto stats = ComputeImuWindowStatistics(
+          imu_datas, trajectory_->maxTimeNsNURBS(), traj_max_time_ns_cur);
+      const Eigen::Vector3d &aver_r = stats.mean_gyro;
+      const Eigen::Vector3d &aver_a = stats.mean_accel;
+      const double var_r = stats.gyro_stddev;
+      const double var_a = stats.accel_stddev;
       // LOG(INFO) << "[aver_r_first] " << aver_r.norm() << " | [aver_a_first] " << aver_a.norm();
       // LOG(INFO) << "[var_r_first] " << var_r << " | [var_a_first] " << var_a;
 
-      if (non_uniform_)
+      if (non_uniform_ && stats.count > 0)
       {
         cp_add_num = GetKnotDensity(aver_r.norm(), aver_a.norm());
       }
@@ -616,34 +631,16 @@ namespace cocolic
     /// update the second seg
     {
       int cp_add_num = cp_add_num_coarse_;
-      Eigen::Vector3d aver_r = Eigen::Vector3d::Zero(), aver_a = Eigen::Vector3d::Zero();
-      double var_r = 0, var_a = 0;
-      int cnt = 0;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < traj_max_time_ns_cur ||
-            imu_datas[i].timestamp >= traj_max_time_ns_next)
-          continue;
-        cnt++;
-        aver_r += imu_datas[i].gyro;
-        aver_a += imu_datas[i].accel;
-      }
-      aver_r /= cnt;
-      aver_a /= cnt;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < traj_max_time_ns_cur ||
-            imu_datas[i].timestamp >= traj_max_time_ns_next)
-          continue;
-        var_r += (imu_datas[i].gyro - aver_r).transpose() * (imu_datas[i].gyro - aver_r);
-        var_a += (imu_datas[i].accel - aver_a).transpose() * (imu_datas[i].accel - aver_a);
-      }
-      var_r = sqrt(var_r / (cnt - 1));
-      var_a = sqrt(var_a / (cnt - 1));
+      const auto stats = ComputeImuWindowStatistics(
+          imu_datas, traj_max_time_ns_cur, traj_max_time_ns_next);
+      const Eigen::Vector3d &aver_r = stats.mean_gyro;
+      const Eigen::Vector3d &aver_a = stats.mean_accel;
+      const double var_r = stats.gyro_stddev;
+      const double var_a = stats.accel_stddev;
       // LOG(INFO) << "[aver_r_second] " << aver_r.norm() << " | [aver_a_second] " << aver_a.norm();
       // LOG(INFO) << "[var_r_second] " << var_r << " | [var_a_second] " << var_a;
 
-      if (non_uniform_)
+      if (non_uniform_ && stats.count > 0)
       {
         cp_add_num = GetKnotDensity(aver_r.norm(), aver_a.norm());
       }
@@ -715,34 +712,16 @@ namespace cocolic
     /// update the first seg
     {
       int cp_add_num = cp_add_num_coarse_;
-      Eigen::Vector3d aver_r = Eigen::Vector3d::Zero(), aver_a = Eigen::Vector3d::Zero();
-      double var_r = 0, var_a = 0;
-      int cnt = 0;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < traj_max_time_ns_next ||
-            imu_datas[i].timestamp >= traj_max_time_ns_next_next)
-          continue;
-        cnt++;
-        aver_r += imu_datas[i].gyro;
-        aver_a += imu_datas[i].accel;
-      }
-      aver_r /= cnt;
-      aver_a /= cnt;
-      for (int i = 0; i < imu_datas.size(); i++)
-      {
-        if (imu_datas[i].timestamp < traj_max_time_ns_next ||
-            imu_datas[i].timestamp >= traj_max_time_ns_next_next)
-          continue;
-        var_r += (imu_datas[i].gyro - aver_r).transpose() * (imu_datas[i].gyro - aver_r);
-        var_a += (imu_datas[i].accel - aver_a).transpose() * (imu_datas[i].accel - aver_a);
-      }
-      var_r = sqrt(var_r / (cnt - 1));
-      var_a = sqrt(var_a / (cnt - 1));
+      const auto stats = ComputeImuWindowStatistics(
+          imu_datas, traj_max_time_ns_next, traj_max_time_ns_next_next);
+      const Eigen::Vector3d &aver_r = stats.mean_gyro;
+      const Eigen::Vector3d &aver_a = stats.mean_accel;
+      const double var_r = stats.gyro_stddev;
+      const double var_a = stats.accel_stddev;
       // LOG(INFO) << "[aver_r_new] " << aver_r.norm() << " | [aver_a_new] " << aver_a.norm();
       // LOG(INFO) << "[var_r_new] " << var_r << " | [var_a_new] " << var_a;
 
-      if (non_uniform_)
+      if (non_uniform_ && stats.count > 0)
       {
         cp_add_num = GetKnotDensity(aver_r.norm(), aver_a.norm());
       }
@@ -793,7 +772,7 @@ namespace cocolic
         trajectory_, 0.0, trajectory_->maxTimeNURBS(), 0.1);
   }
 
-  // GL2 step-1: open a mapper_contract rosbag2 for the /*_for_gs streams.
+  // Mapper-contract: open a mapper_contract rosbag2 for the /*_for_gs streams.
   void OdometryManager::OpenForGsWriter(const std::string &out_dir)
   {
     namespace fs = std::filesystem;
@@ -808,30 +787,30 @@ namespace cocolic
     co.output_serialization_format = "cdr";
     forgs_writer_->open(so, co);
     forgs_open_ = true;
-    std::cout << "\n[GL2] for_gs mapper-contract writer -> " << out_dir << "\n";
+    std::cout << "\n[cocolic_ros2] for_gs mapper-contract writer -> " << out_dir << "\n";
   }
 
-  // GL2 step-2: create live /*_for_gs publishers (best_effort/keep_last to match
-  // the mapper's sensor QoS) so the CUDA mapper can run concurrently with track A.
+  // Mapper-feedback: create live /*_for_gs publishers (best_effort/keep_last to match
+  // the mapper's sensor QoS) so the CUDA mapper can run concurrently with Coco-LIC.
   void OdometryManager::OpenForGsLivePublishers()
   {
     if (gs_node_) return;
     gs_node_ = rclcpp::Node::make_shared("cocolic_gs_frontend");
-    // GL2 step-2 flow control: RELIABLE + deep history so the mapper buffers
-    // every frame and reliable backpressure paces track A to mapper throughput
-    // (best_effort dropped ~90% when track A out-paced the mapper).
+    // Mapper-feedback flow control: RELIABLE + deep history so the mapper buffers
+    // every frame and reliable backpressure paces Coco-LIC to mapper throughput
+    // (best_effort dropped ~90% when Coco-LIC out-paced the mapper).
     auto qos = rclcpp::QoS(rclcpp::KeepLast(200)).reliable();
-    pub_gs_img_ = gs_node_->create_publisher<sensor_msgs::msg::Image>("/image_for_gs", qos);
-    pub_gs_depth_ = gs_node_->create_publisher<sensor_msgs::msg::Image>("/depth_for_gs", qos);
-    pub_gs_caminfo_ = gs_node_->create_publisher<sensor_msgs::msg::CameraInfo>("/camera_info_for_gs", qos);
-    pub_gs_pose_ = gs_node_->create_publisher<geometry_msgs::msg::PoseStamped>("/pose_for_gs", qos);
-    pub_gs_points_ = gs_node_->create_publisher<sensor_msgs::msg::PointCloud2>("/points_for_gs", qos);
+    pub_gs_img_ = gs_node_->create_publisher<sensor_msgs::msg::Image>(gs_image_topic_, qos);
+    pub_gs_depth_ = gs_node_->create_publisher<sensor_msgs::msg::Image>(gs_depth_topic_, qos);
+    pub_gs_caminfo_ = gs_node_->create_publisher<sensor_msgs::msg::CameraInfo>(gs_camera_info_topic_, qos);
+    pub_gs_pose_ = gs_node_->create_publisher<geometry_msgs::msg::PoseStamped>(gs_pose_topic_, qos);
+    pub_gs_points_ = gs_node_->create_publisher<sensor_msgs::msg::PointCloud2>(gs_points_topic_, qos);
 
-    // GL2 step-2bc: subscribe to the mapper's rendered feedback (reliable, to match
+    // Mapper-feedback: subscribe to the mapper's rendered feedback (reliable, to match
     // the mapper's rendered_feedback_qos). Lightweight callback: stash by observed_stamp.
     auto fb_qos = rclcpp::QoS(rclcpp::KeepLast(64)).reliable();
     sub_gs_feedback_ = gs_node_->create_subscription<gaussian_lic_msgs::msg::RenderedFeedback>(
-        "/gaussian_lic/rendered_feedback", fb_qos,
+        rendered_feedback_topic_, fb_qos,
         [this](gaussian_lic_msgs::msg::RenderedFeedback::SharedPtr m) {
           int64_t obs_ns = static_cast<int64_t>(m->observed_stamp.sec) * 1000000000LL +
                            m->observed_stamp.nanosec;
@@ -841,10 +820,10 @@ namespace cocolic
           gs_fb_last_observed_ns_ = obs_ns;
           while (gs_feedback_.size() > 200) gs_feedback_.erase(gs_feedback_.begin());
         });
-    std::cout << "\n[GL2] for_gs LIVE pubs + rendered_feedback sub up (closed-loop coupling)\n";
+    std::cout << "\n[cocolic_ros2] for_gs LIVE pubs + rendered_feedback sub up (closed-loop coupling)\n";
   }
 
-  // GL2 step-2c: build the per-frame render-photometric reference. For each visible
+  // Render-photometric: build the per-frame render-photometric reference. For each visible
   // map point (v_points_ / px_obss_), sample a patch from the mapper's latest RENDERED
   // image at that pixel (the map's expected appearance) -> reference; the observed gray
   // image is the sample target. Hands both to trajectory_manager for the LIC solve.
@@ -901,13 +880,12 @@ namespace cocolic
       valid[i] = 1;
       ++n_valid;
     }
-    static int64_t bp_cnt = 0;
-    if (++bp_cnt % 25 == 0)
-      std::cout << "[GL2 render-photo] valid_patches=" << n_valid << "/" << v_points_.size() << "\n";
+    if (++render_photo_probe_count_ % 25 == 0)
+      std::cout << "[Mapper-feedback render-photo] valid_patches=" << n_valid << "/" << v_points_.size() << "\n";
     trajectory_manager_->SetRenderPhotometric(observed_gray, std::move(patches), std::move(valid), half, rp_weight_);
   }
 
-  // GL2 lockstep pacing (OQ4 fix): block after a published frame until the mapper's
+  // Mapper lockstep pacing (OQ4 fix): block after a published frame until the mapper's
   // latest feedback corresponds to a frame within max_lag of pub_abs_ns (or timeout).
   // Caps feedback staleness to ~one mapper-frame latency so the photometric factor
   // gets a rendered view that still overlaps the current observation.
@@ -928,29 +906,28 @@ namespace cocolic
     }
   }
 
-  // GL2 step-2bc: drain the rendered_feedback subscription each RunBag iteration +
+  // Mapper-feedback: drain the rendered_feedback subscription each RunBag iteration +
   // timing probe answering OQ4 — is feedback fresh enough to refine still-active knots?
   void OdometryManager::SpinForGsFeedback()
   {
     if (!gs_node_) return;
     rclcpp::spin_some(gs_node_);
-    static int64_t probe_cnt = 0;
     int64_t n, last_obs;
     {
       std::lock_guard<std::mutex> lk(gs_fb_mutex_);
       n = gs_fb_count_; last_obs = gs_fb_last_observed_ns_;
     }
-    if (n > 0 && (++probe_cnt % 25 == 0))
+    if (n > 0 && (++feedback_probe_count_ % 25 == 0))
     {
       // active_time is relative to data start; feedback observed_stamp is absolute.
       int64_t active_abs = trajectory_->GetActiveTime() + trajectory_->GetDataStartTime();
       double lag_s = static_cast<double>(active_abs - last_obs) / 1e9;
-      std::cout << "[GL2 probe] feedback_count=" << n
+      std::cout << "[Mapper-feedback probe] feedback_count=" << n
                 << " last_obs_lag_vs_active=" << lag_s << "s (>0 = feedback older than active window edge)\n";
     }
   }
 
-  // GL2 step-1/2: build one frame of the tracking-to-mapping interface (track A's
+  // ROS2 mapper-contract: build one frame of the tracking-to-mapping interface (Coco-LIC
   // stable poses) — image(bgr8)/depth(32FC1 m)/camera_info(K_)/pose(Twc)/points(xyzrgb)
   // — then write it to the mapper_contract bag (step-1) and/or publish it live (step-2).
   void OdometryManager::WriteForGsFrame(
@@ -961,28 +938,31 @@ namespace cocolic
   {
     if (!forgs_open_ && !gs_live_publish_) return;
     rclcpp::Time stamp(stamp_ns);
-    std_msgs::msg::Header hdr;
-    hdr.stamp = stamp;
-    hdr.frame_id = "camera";
+    std_msgs::msg::Header sensor_hdr;
+    sensor_hdr.stamp = stamp;
+    sensor_hdr.frame_id = image_frame_;
+    std_msgs::msg::Header map_hdr;
+    map_hdr.stamp = stamp;
+    map_hdr.frame_id = world_frame_;
 
     sensor_msgs::msg::Image img_msg;
-    { cv_bridge::CvImage cvi; cvi.header = hdr; cvi.encoding = "bgr8"; cvi.image = img_bgr;
+    { cv_bridge::CvImage cvi; cvi.header = sensor_hdr; cvi.encoding = "bgr8"; cvi.image = img_bgr;
       img_msg = *cvi.toImageMsg(); }
 
     sensor_msgs::msg::Image depth_msg;
-    { cv_bridge::CvImage cvi; cvi.header = hdr; cvi.encoding = "32FC1"; cvi.image = depth32f;
+    { cv_bridge::CvImage cvi; cvi.header = sensor_hdr; cvi.encoding = "32FC1"; cvi.image = depth32f;
       depth_msg = *cvi.toImageMsg(); }
 
-    sensor_msgs::msg::CameraInfo ci; ci.header = hdr;
+    sensor_msgs::msg::CameraInfo ci; ci.header = sensor_hdr;
     ci.width = img_bgr.cols; ci.height = img_bgr.rows;
     ci.k = {K_(0,0),0.0,K_(0,2), 0.0,K_(1,1),K_(1,2), 0.0,0.0,1.0};
 
-    geometry_msgs::msg::PoseStamped ps; ps.header = hdr;
+    geometry_msgs::msg::PoseStamped ps; ps.header = map_hdr;
     ps.pose.position.x = t_wc.x(); ps.pose.position.y = t_wc.y(); ps.pose.position.z = t_wc.z();
     ps.pose.orientation.x = q_wc.x(); ps.pose.orientation.y = q_wc.y();
     ps.pose.orientation.z = q_wc.z(); ps.pose.orientation.w = q_wc.w();
 
-    sensor_msgs::msg::PointCloud2 pc; pc.header = hdr;
+    sensor_msgs::msg::PointCloud2 pc; pc.header = map_hdr;
     pc.height = 1; pc.width = static_cast<uint32_t>(pts.size());
     pc.is_bigendian = false; pc.is_dense = true;
     auto add_field = [&](const std::string &nm, uint32_t off) {
@@ -1006,11 +986,11 @@ namespace cocolic
     }
 
     if (forgs_open_) {  // step-1: persist to mapper_contract bag
-      forgs_writer_->write(img_msg, "/image_for_gs", stamp);
-      forgs_writer_->write(depth_msg, "/depth_for_gs", stamp);
-      forgs_writer_->write(ci, "/camera_info_for_gs", stamp);
-      forgs_writer_->write(ps, "/pose_for_gs", stamp);
-      forgs_writer_->write(pc, "/points_for_gs", stamp);
+      forgs_writer_->write(img_msg, gs_image_topic_, stamp);
+      forgs_writer_->write(depth_msg, gs_depth_topic_, stamp);
+      forgs_writer_->write(ci, gs_camera_info_topic_, stamp);
+      forgs_writer_->write(ps, gs_pose_topic_, stamp);
+      forgs_writer_->write(pc, gs_points_topic_, stamp);
     }
     if (gs_live_publish_) {  // step-2: live to the concurrent mapper
       pub_gs_img_->publish(img_msg);
@@ -1023,7 +1003,7 @@ namespace cocolic
 
   void OdometryManager::Publish3DGSMappingData(const NextMsgs& msg)
   {
-    // GL2: generate the tracking→mapping interface (track A's stable poses).
+    // ROS2 mapper: generate the tracking->mapping interface (Coco-LIC stable poses).
     // step-2 (gs_live_publish): publish live to a concurrent mapper;
     // step-1 (default): persist to the mapper_contract rosbag2 for offline replay.
     if (gs_live_publish_) {
@@ -1034,9 +1014,12 @@ namespace cocolic
 
     time_buf.push(msg.image_timestamp);
     lidar_buf.push(lidar_handler_->GetFeatureCurrent());
-    img_buf.push(camera_handler_->img_pose_->m_img);
+    img_buf.push(camera_handler_->img_pose_->m_img.clone());
 
-    while(1)
+    if (time_buf.size() != lidar_buf.size() || time_buf.size() != img_buf.size())
+      throw std::logic_error("3DGS frame queues lost synchronization");
+
+    while (!time_buf.empty() && !lidar_buf.empty() && !img_buf.empty())
     {
       int64_t active_time = trajectory_->GetActiveTime();
       if (time_buf.front() < active_time && lidar_buf.front().time_max < active_time)
@@ -1047,6 +1030,12 @@ namespace cocolic
         time_buf.pop();
         lidar_buf.pop();
         img_buf.pop();
+        if (img.empty() || img.type() != CV_8UC3)
+        {
+          RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                      "Dropping 3DGS frame with an empty or non-BGR8 image");
+          continue;
+        }
 
         PosCloud::Ptr cloud_undistort_ds = PosCloud::Ptr(new PosCloud);
         // PosCloud::Ptr cloud_distort_ds = lidar.surface_features;
@@ -1062,8 +1051,8 @@ namespace cocolic
         auto cam_K = camera_handler_->m_camera_intrinsic;
         double fx = cam_K(0, 0), fy = cam_K(1, 1);
         double cx = cam_K(0, 2), cy = cam_K(1, 2);
-        int H = camera_handler_->img_pose_->m_img.rows;
-        int W = camera_handler_->img_pose_->m_img.cols;
+        const int H = img.rows;
+        const int W = img.cols;
 
         // depth
         cv::Mat depthmap = cv::Mat::zeros(H, W, CV_32FC1);
@@ -1074,13 +1063,15 @@ namespace cocolic
           {
             auto pt = lidarpoint->points[i];
             Eigen::Vector3d pt_w = Eigen::Vector3d(pt.x, pt.y, pt.z);
+            if (!pt_w.allFinite()) continue;
             Eigen::Vector3d pt_c = inv_pose_cam.unit_quaternion().toRotationMatrix() * pt_w + inv_pose_cam.translation();
             double depth = pt_c(2);
+            if (!pt_c.allFinite() || !std::isfinite(depth) || depth <= 0) continue;
             pt_c /= pt_c(2);
             double u = fx * pt_c(0) + cx;
             double v = fy * pt_c(1) + cy;
+            if (!std::isfinite(u) || !std::isfinite(v)) continue;
             int i_u = std::round(u), i_v = std::round(v);
-            if (depth <= 0) continue;
             if (!((i_u >= 0 && i_u < W && i_v >= 0 && i_v < H))) continue;
 
             float& current_depth = depthmap.at<float>(i_v, i_u);
@@ -1096,15 +1087,20 @@ namespace cocolic
         }
         // points
         int filter_cnt = 0;
-        int skip = lidar_skip_;
+        const int skip = lidar_skip_;
         Eigen::aligned_vector<Eigen::Vector3d> new_points;
         Eigen::aligned_vector<Eigen::Vector3i> new_colors;
         for (int i = 0; i < cloud_undistort_ds->points.size(); i += skip)
         {
           auto pt = cloud_undistort_ds->points[i];
           Eigen::Vector3d pt_w = Eigen::Vector3d(pt.x, pt.y, pt.z);
+          if (!pt_w.allFinite())
+          {
+            filter_cnt++;
+            continue;
+          }
           Eigen::Vector3d pt_c = inv_pose_cam.unit_quaternion().toRotationMatrix() * pt_w + inv_pose_cam.translation();
-          if (pt_c(2) < 0.01)
+          if (!pt_c.allFinite() || !std::isfinite(pt_c(2)) || pt_c(2) < 0.01)
           {
             filter_cnt++;
             continue;
@@ -1112,13 +1108,12 @@ namespace cocolic
           pt_c /= pt_c(2);
           double u = fx * pt_c(0) + cx;
           double v = fy * pt_c(1) + cy;
-          if (u < 0 || u > W - 1)
+          if (!std::isfinite(u) || !std::isfinite(v) ||
+              u < 0 || u > W - 1 || v < 0 || v > H - 1)
           {
             filter_cnt++;
             continue;
           }
-          new_points.push_back(Eigen::Vector3d(pt.x, pt.y, pt.z));
-
           int i_u = std::round(u), i_v = std::round(v);
           int blue = 0, green = 0, red = 0;
           if (i_u >= 0 && i_u < W && i_v >= 0 && i_v < H)
@@ -1127,10 +1122,10 @@ namespace cocolic
             int u1 = std::min(u0 + 1, W - 1), v1 = std::min(v0 + 1, H - 1);
             double du = u - u0, dv = v - v0;
 
-            cv::Vec3b c00 = camera_handler_->img_pose_->m_img.at<cv::Vec3b>(v0, u0);
-            cv::Vec3b c10 = camera_handler_->img_pose_->m_img.at<cv::Vec3b>(v0, u1);
-            cv::Vec3b c01 = camera_handler_->img_pose_->m_img.at<cv::Vec3b>(v1, u0);
-            cv::Vec3b c11 = camera_handler_->img_pose_->m_img.at<cv::Vec3b>(v1, u1);
+            cv::Vec3b c00 = img.at<cv::Vec3b>(v0, u0);
+            cv::Vec3b c10 = img.at<cv::Vec3b>(v0, u1);
+            cv::Vec3b c01 = img.at<cv::Vec3b>(v1, u0);
+            cv::Vec3b c11 = img.at<cv::Vec3b>(v1, u1);
 
             Eigen::Vector3d color00(c00[0], c00[1], c00[2]);
             Eigen::Vector3d color10(c10[0], c10[1], c10[2]);
@@ -1146,22 +1141,29 @@ namespace cocolic
             green = std::round(interpolated_color.y());
             red = std::round(interpolated_color.z());
           }
+          new_points.push_back(pt_w);
           new_colors.push_back(Eigen::Vector3i(red, green, blue));
         }
-        // GL2 step-1: emit the full frame (image/depth/pose/points) to the
-        // mapper_contract bag in one shot — track A's pose is the contract.
+        // Mapper-contract: emit the full frame (image/depth/pose/points) to the
+        // mapper_contract bag in one shot; Coco-LIC pose is the contract.
         WriteForGsFrame(img, depthmap, pose_cam.unit_quaternion(),
                         pose_cam.translation(), new_points, new_colors,
                         time + trajectory_->GetDataStartTime());
-        // GL2 lockstep: wait for the mapper to catch up before advancing (caps feedback lag).
+        // Mapper lockstep: wait for the mapper to catch up before advancing (caps feedback lag).
         PaceForGsFeedback(time + trajectory_->GetDataStartTime());
       }
       else break;
     }
   }
 
-  double OdometryManager::SaveOdometry()
+  bool OdometryManager::SaveOdometry()
   {
+    if (!is_initialized_ || trajectory_->knts.size() < 2)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "No initialized trajectory was produced; skipping trajectory export");
+      return false;
+    }
     std::string descri;
     if (odometry_mode_ == LICO)
       descri = "LICO";
@@ -1173,19 +1175,15 @@ namespace cocolic
 
     // ROS2 port: dropped unused ros::Time-based filename suffix (t_str unused).
 
-    int idx = -1;
-    int64_t true_maxtime = trajectory_->maxTimeNsNURBS();
-    for (int i = trajectory_->knts.size() - 1; i >= 0; i--)
+    const int64_t maxtime =
+        trajectory_->maxTimeNsNURBS() - static_cast<int64_t>(0.1 * S_TO_NS);
+    if (maxtime <= 0)
     {
-      if (true_maxtime == trajectory_->knts[i])
-      {
-        idx = i;
-        break;
-      }
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Trajectory is shorter than the 0.1 s export margin; "
+                  "skipping trajectory export");
+      return false;
     }
-    idx -= 1;
-    int64_t maxtime = trajectory_->knts[idx];
-    maxtime = trajectory_->maxTimeNsNURBS() - 0.1 * S_TO_NS;
 
     trajectory_->ToTUMTxt(cache_path_ + "_" + descri + ".txt", maxtime, is_evo_viral_,
                           0.01);  // 100Hz pose querying
@@ -1193,7 +1191,7 @@ namespace cocolic
     // int sum_cp = std::accumulate(cp_num_vec.begin(), cp_num_vec.end(), 0);
     // std::cout << GREEN << "ave_cp_num " << sum_cp * 1.0 / cp_num_vec.size() << RESET << std::endl;
 
-    return trajectory_->maxTimeNURBS();
+    return true;
   }
 
 } // namespace cocolic

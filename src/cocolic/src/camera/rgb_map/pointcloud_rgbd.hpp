@@ -46,6 +46,7 @@ Dr. Fu Zhang < fuzhang@hku.hk >.
  POSSIBILITY OF SUCH DAMAGE.
 */
 #pragma once
+
 #include <atomic>
 #include <unordered_set>
 #include "tools_logger.hpp"
@@ -172,6 +173,7 @@ struct Global_map
     bool                                                         m_in_appending_pts = 0;
     int                                                          m_updated_frame_index = 0;
     std::shared_ptr< std::thread >                               m_thread_service;
+    std::atomic<bool>                                            m_stop_service{false};
     int                                                          m_if_reload_init_voxel_and_hashed_pts = true;
 
     Hash_map_3d< long, RGB_pt_ptr >   m_hashmap_3d_pts;
@@ -201,8 +203,8 @@ struct Global_map
     void selection_points_for_projection( bool is_3dgs, Eigen::aligned_vector<Eigen::Vector3d>& new_points, Eigen::aligned_vector<Eigen::Vector2d>& new_pixs,
                                           std::shared_ptr< Image_frame > &image_pose, std::vector< std::shared_ptr< RGB_pts > > *pc_out_vec = nullptr,
                                           std::vector< cv::Point2f > *pc_2d_out_vec = nullptr, double minimum_dis = 5, int skip_step = 1,int use_all_pts = 0 );
-    void save_to_pcd( std::string dir_name, std::string file_name = std::string( "/rgb_pt" ) , int save_pts_with_views = 3);
-    void save_and_display_pointcloud( std::string dir_name = std::string( "/home/ziv/temp/" ), std::string file_name = std::string( "/rgb_pt" ) ,  int save_pts_with_views = 3);
+    void save_to_pcd( std::string dir_name, std::string file_name = std::string( "rgb_pt" ) , int save_pts_with_views = 3);
+    void save_and_display_pointcloud( std::string dir_name = std::string( "." ), std::string file_name = std::string( "rgb_pt" ) , int save_pts_with_views = 3, bool display = false);
     void render_pts_in_voxels( std::shared_ptr< Image_frame > &img_ptr, std::vector< std::shared_ptr< RGB_pts > > &voxels_for_render, double obs_time = 0 );
 
   private:

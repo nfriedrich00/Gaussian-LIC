@@ -83,6 +83,14 @@ void Rgbmap_tracker::update_and_append_track_pts(std::shared_ptr<Image_frame> &i
         RGB_pts *rgb_pt = ((RGB_pts *)it->first);
         vec_3 pt_3d = ((RGB_pts *)it->first)->get_pos();
         int res = img_pose->project_3d_point_in_this_img(pt_3d, u_d, v_d, nullptr, 1.0);
+        if (!res)
+        {
+            // The projection routine deliberately leaves u/v untouched when a
+            // point is behind the camera or outside the valid image domain.
+            // Drop the stale track before deriving any pixel-space values.
+            it = m_map_rgb_pts_in_last_frame_pos.erase(it);
+            continue;
+        }
         u_i = std::round(u_d / mini_dis) * mini_dis;
         v_i = std::round(v_d / mini_dis) * mini_dis;
 
@@ -107,18 +115,11 @@ void Rgbmap_tracker::update_and_append_track_pts(std::shared_ptr<Image_frame> &i
             rgb_pt->m_is_out_lier_count = 0;
         }
 
-        if (res)
+        double depth = (pt_3d - img_pose->m_pose_w2c_t).norm();
+        if (map_2d_pts_occupied.if_exist(u_i, v_i) == false)
         {
-            double depth = (pt_3d - img_pose->m_pose_w2c_t).norm();
-            if (map_2d_pts_occupied.if_exist(u_i, v_i) == false)
-            {
-                map_2d_pts_occupied.insert(u_i, v_i, depth);
-                // it->second = cv::Point2f(u, v);
-            }
-        }
-        else
-        {
-            // m_map_rgb_pts_in_last_frame_pos.erase(it);
+            map_2d_pts_occupied.insert(u_i, v_i, depth);
+            // it->second = cv::Point2f(u, v);
         }
         it++;
     }
@@ -150,25 +151,26 @@ void Rgbmap_tracker::update_and_append_track_pts(std::shared_ptr<Image_frame> &i
             }
             vec_3 pt_3d = (*map_rgb.m_pts_rgb_vec_for_projection)[i]->get_pos();
             int res = img_pose->project_3d_point_in_this_img(pt_3d, u_d, v_d, nullptr, 1.0);
+            if (!res)
+            {
+                continue;
+            }
             u_i = std::round(u_d / mini_dis) * mini_dis;
             v_i = std::round(v_d / mini_dis) * mini_dis;
             // vec_3 rgb_color = img_pose->get_rgb(u, v);
             // double grey = img_pose->get_grey_color(u, v);
             // (*map_rgb.m_pts_rgb_vec_for_projection)[i]->update_gray(grey);
             // (*map_rgb.m_pts_rgb_vec_for_projection)[i]->update_rgb(rgb_color);
-            if (res)
+            double depth = (pt_3d - img_pose->m_pose_w2c_t).norm();
+            if (map_2d_pts_occupied.if_exist(u_i, v_i) == false)
             {
-                double depth = (pt_3d - img_pose->m_pose_w2c_t).norm();
-                if (map_2d_pts_occupied.if_exist(u_i, v_i) == false)
-                {
-                    map_2d_pts_occupied.insert(u_i, v_i, depth);
-                    m_map_rgb_pts_in_last_frame_pos[(*map_rgb.m_pts_rgb_vec_for_projection)[i].get()] =
-                        cv::Point2f(u_d, v_d);
-                    new_added_pts++;
+                map_2d_pts_occupied.insert(u_i, v_i, depth);
+                m_map_rgb_pts_in_last_frame_pos[(*map_rgb.m_pts_rgb_vec_for_projection)[i].get()] =
+                    cv::Point2f(u_d, v_d);
+                new_added_pts++;
 
-                    // new_points.push_back(Eigen::Vector3d(pt_3d.x(), pt_3d.y(), pt_3d.z()));
-                    // new_pixs.push_back(Eigen::Vector2d(u_d, v_d));
-                }
+                // new_points.push_back(Eigen::Vector3d(pt_3d.x(), pt_3d.y(), pt_3d.z()));
+                // new_pixs.push_back(Eigen::Vector2d(u_d, v_d));
             }
             new_add_pt++;
             if (m_map_rgb_pts_in_last_frame_pos.size() >= m_maximum_vio_tracked_pts)
@@ -196,7 +198,8 @@ void Rgbmap_tracker::reject_error_tracking_pts(std::shared_ptr<Image_frame> &img
     // cout << "Image pose: ";
     // img_pose->display_pose();
     scope_color(ANSI_COLOR_BLUE_BOLD);
-    for (auto it = m_map_rgb_pts_in_current_frame_pos.begin(); it != m_map_rgb_pts_in_current_frame_pos.end(); it++)
+    for (auto it = m_map_rgb_pts_in_current_frame_pos.begin();
+         it != m_map_rgb_pts_in_current_frame_pos.end();)
     {
         cv::Point2f predicted_pt = it->second;
         vec_3 pt_3d = ((RGB_pts *)it->first)->get_pos();
@@ -206,8 +209,9 @@ void Rgbmap_tracker::reject_error_tracking_pts(std::shared_ptr<Image_frame> &img
             if ((fabs(u - predicted_pt.x) > dis) || (fabs(v - predicted_pt.y) > dis))
             {
                 // Remove tracking pts
-                m_map_rgb_pts_in_current_frame_pos.erase(it);
+                it = m_map_rgb_pts_in_current_frame_pos.erase(it);
                 remove_count++;
+                continue;
             }
         }
         else
@@ -215,9 +219,11 @@ void Rgbmap_tracker::reject_error_tracking_pts(std::shared_ptr<Image_frame> &img
             // cout << pt_3d.transpose() << " | ";
             // cout << "Predicted: " << vec_2(predicted_pt.x, predicted_pt.y).transpose() << ", measure: " << vec_2(u,
             // v).transpose() << endl;
-            m_map_rgb_pts_in_current_frame_pos.erase(it);
+            it = m_map_rgb_pts_in_current_frame_pos.erase(it);
             remove_count++;
+            continue;
         }
+        ++it;
     }
     cout << "Total pts = " << total_count << ", rejected pts = " << remove_count << endl;
 }

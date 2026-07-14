@@ -61,8 +61,8 @@ struct PointType_CMP{
 };
 
 struct BoxPointType{
-    float vertex_min[3];
-    float vertex_max[3];
+    float vertex_min[3] = {0.0f, 0.0f, 0.0f};
+    float vertex_max[3] = {0.0f, 0.0f, 0.0f};
 };
 
 enum operation_set {ADD_POINT, DELETE_POINT, DELETE_BOX, ADD_BOX, DOWNSAMPLE_DELETE, PUSH_DOWN};
@@ -70,17 +70,18 @@ enum operation_set {ADD_POINT, DELETE_POINT, DELETE_BOX, ADD_BOX, DOWNSAMPLE_DEL
 enum delete_point_storage_set {NOT_RECORD, DELETE_POINTS_REC, MULTI_THREAD_REC};
 
 struct Operation_Logger_Type{
-    PointType point;
-    BoxPointType boxpoint;
-    bool tree_deleted, tree_downsample_deleted;
-    operation_set op;
+    PointType point{};
+    BoxPointType boxpoint{};
+    bool tree_deleted = false;
+    bool tree_downsample_deleted = false;
+    operation_set op = ADD_POINT;
 };
 
 class MANUAL_Q{
     private:
         int head = 0,tail = 0, counter = 0;
         Operation_Logger_Type q[Q_LEN];
-        bool is_empty;
+        bool is_empty = true;
     public:
         void pop();
         Operation_Logger_Type front();
@@ -116,7 +117,8 @@ private:
     // Multi-thread Tree Rebuild
     bool termination_flag = false;
     bool rebuild_flag = false;
-    pthread_t rebuild_thread;
+    pthread_t rebuild_thread{};
+    bool rebuild_thread_started = false;
     pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex, search_flag_mutex;
     pthread_mutex_t rebuild_logger_mutex_lock, points_deleted_rebuild_mutex_lock;
     // queue<Operation_Logger_Type> Rebuild_Logger;

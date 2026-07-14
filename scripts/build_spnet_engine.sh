@@ -243,6 +243,7 @@ torch.onnx.export(
         "pred": {0: "batch", 2: "height", 3: "width"},
     },
     opset_version=17,
+    dynamo=False,
 )
 print(f"exported {onnx_path} using device={device}")
 PY
@@ -261,8 +262,11 @@ try:
     import nvidia.cublas
 except Exception:
     raise SystemExit(0)
-base = Path(nvidia.cublas.__file__).resolve().parent / "lib"
-if (base / "libcublas.so.11").is_file():
+module_file = getattr(nvidia.cublas, "__file__", None)
+if not module_file:
+    raise SystemExit(0)
+base = Path(module_file).resolve().parent / "lib"
+if base.is_dir() and (base / "libcublas.so.11").is_file():
     print(base)
 PY
 )"
@@ -280,7 +284,10 @@ try:
     module = importlib.import_module(module_name)
 except Exception:
     raise SystemExit(0)
-base = Path(module.__file__).resolve().parent / "lib"
+module_file = getattr(module, "__file__", None)
+if not module_file:
+    raise SystemExit(0)
+base = Path(module_file).resolve().parent / "lib"
 if base.is_dir():
     print(base)
 PY

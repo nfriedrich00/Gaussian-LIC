@@ -2,19 +2,22 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <deque>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -23,6 +26,7 @@
 #include <vector>
 
 #include <builtin_interfaces/msg/time.hpp>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <gaussian_lic_msgs/msg/gaussian.hpp>
 #include <gaussian_lic_msgs/msg/gaussian_array.hpp>
 #include <gaussian_lic_msgs/msg/mapping_status.hpp>
@@ -34,8 +38,10 @@
 #endif
 #include <gaussian_lic_mapping/frame_data.hpp>
 #include <gaussian_lic_mapping/mapper_dataset.hpp>
+#include <gaussian_lic_mapping/optimization_sampling.hpp>
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
 #include <gaussian_lic_mapping/torch_backend.hpp>
+#include <torch/script.h>
 #endif
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -53,12 +59,120 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
 using namespace std::chrono_literals;
 using gaussian_lic_mapping::AlignedRosFrame;
 using gaussian_lic_mapping::MapperDataset;
 using gaussian_lic_mapping::MapperFrameData;
+
+namespace
+{
+
+class DepthCompletionFatalError : public std::runtime_error
+{
+public:
+  using std::runtime_error::runtime_error;
+};
+
+std::string resolve_depth_completion_engine_path(
+  const std::string & configured,
+  const int width,
+  const int height)
+{
+  if (!configured.empty()) {
+    if (configured.rfind("~/", 0) == 0) {
+      if (const char * home = std::getenv("HOME")) {
+        return (std::filesystem::path(home) / configured.substr(2)).string();
+      }
+    }
+    return configured;
+  }
+  if (const char * environment_path = std::getenv("GAUSSIAN_LIC_SPNET_ENGINE")) {
+    if (environment_path[0] != '\0') {
+      return environment_path;
+    }
+  }
+  const char * home = std::getenv("HOME");
+  if (home == nullptr || width <= 0 || height <= 0) {
+    return {};
+  }
+  const std::filesystem::path engine_dir =
+    std::filesystem::path(home) / "Software" / "TensorRT-engines";
+  const std::string dimensions = std::to_string(height) + "_" + std::to_string(width);
+  const std::filesystem::path candidates[] = {
+    engine_dir / ("spnet_" + dimensions + "_fp16.engine"),
+    engine_dir / ("spnet_" + dimensions + ".engine"),
+  };
+  for (const auto & candidate : candidates) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(candidate, error) && !error) {
+      return candidate.string();
+    }
+  }
+  return {};
+}
+
+std::string resolve_lpips_model_path(const std::string & configured)
+{
+  auto normalize = [] (const std::string & value) {
+      std::filesystem::path path(value);
+      if (value.rfind("~/", 0) == 0) {
+        if (const char * home = std::getenv("HOME")) {
+          path = std::filesystem::path(home) / value.substr(2);
+        }
+      }
+      std::error_code error;
+      if (std::filesystem::is_directory(path, error) && !error) {
+        path /= "lpips_alex.pt";
+      }
+      return path.string();
+    };
+
+  if (!configured.empty()) {
+    return normalize(configured);
+  }
+  if (const char * environment_path = std::getenv("GAUSSIAN_LIC_LPIPS_MODEL")) {
+    if (environment_path[0] != '\0') {
+      return normalize(environment_path);
+    }
+  }
+  try {
+    return (
+      std::filesystem::path(
+        ament_index_cpp::get_package_share_directory("gaussian_lic_mapping")) /
+      "models" / "lpips_alex.pt").string();
+  } catch (const std::exception &) {
+    return {};
+  }
+}
+
+std::string json_escape(const std::string & input)
+{
+  std::ostringstream escaped;
+  escaped << std::hex << std::setfill('0');
+  for (const unsigned char byte : input) {
+    switch (byte) {
+      case '"': escaped << "\\\""; break;
+      case '\\': escaped << "\\\\"; break;
+      case '\b': escaped << "\\b"; break;
+      case '\f': escaped << "\\f"; break;
+      case '\n': escaped << "\\n"; break;
+      case '\r': escaped << "\\r"; break;
+      case '\t': escaped << "\\t"; break;
+      default:
+        if (byte < 0x20U) {
+          escaped << "\\u" << std::setw(4) << static_cast<unsigned int>(byte);
+        } else {
+          escaped << static_cast<char>(byte);
+        }
+    }
+  }
+  return escaped.str();
+}
+
+}  // namespace
 
 struct QosProfileParams
 {
@@ -135,6 +249,8 @@ public:
       rendered_feedback_pose_topic_ == pose_topic_;
     gaussian_map_topic_ = declare_parameter<std::string>("gaussian_map_topic", "/gaussian_lic/gaussian_map");
     save_map_service_ = declare_parameter<std::string>("save_map_service", "/gaussian_lic/save_map");
+    end_of_input_service_ = declare_parameter<std::string>(
+      "end_of_input_service", "/gaussian_lic/end_of_input");
     world_frame_ = declare_parameter<std::string>("world_frame", "map");
     camera_frame_ = declare_parameter<std::string>("camera_frame", "camera");
     publish_tf_ = declare_parameter<bool>("publish_tf", false);
@@ -144,6 +260,9 @@ public:
       normalized_qos_token(declare_parameter<std::string>("sync_anchor_stream", "pointcloud"));
     sync_anchor_stream_ = parse_sync_anchor_stream(sync_anchor_stream_name_);
     max_queue_size_ = declare_parameter<int>("max_queue_size", 10000);
+    if (max_queue_size_ <= 0) {
+      throw std::invalid_argument("max_queue_size must be positive");
+    }
     sensor_qos_reliability_ = declare_parameter<std::string>("sensor_qos_reliability", "best_effort");
     sensor_qos_history_ = declare_parameter<std::string>("sensor_qos_history", "keep_last");
     sensor_qos_depth_ = declare_parameter<int>("sensor_qos_depth", 5);
@@ -165,8 +284,16 @@ public:
       declare_topic_qos("rendered_feedback_pose", feedback_pose_qos_defaults);
     process_period_ms_ = declare_parameter<int>("process_period_ms", 5);
     select_every_k_frame_ = declare_parameter<int>("select_every_k_frame", 8);
-    test_frame_stride_ =
-      std::max(1, static_cast<int>(declare_parameter<int>("test_frame_stride", 1)));
+    test_frame_stride_ = declare_parameter<int>("test_frame_stride", 1);
+    if (process_period_ms_ <= 0) {
+      throw std::invalid_argument("process_period_ms must be positive");
+    }
+    if (select_every_k_frame_ <= 0) {
+      throw std::invalid_argument("select_every_k_frame must be positive");
+    }
+    if (test_frame_stride_ <= 0) {
+      throw std::invalid_argument("test_frame_stride must be positive");
+    }
     require_depth_topic_ = declare_parameter<bool>("require_depth_topic", true);
     require_projected_point_color_ = declare_parameter<bool>("require_projected_point_color", true);
     zbuffer_projected_points_ = declare_parameter<bool>("zbuffer_projected_points", false);
@@ -180,6 +307,28 @@ public:
     depth_completion_engine_path_ = declare_parameter<std::string>("depth_completion_engine_path", "");
     backend_config_.patch_size = declare_parameter<int>("patch_size", 10);
     backend_config_.max_depth = declare_parameter<double>("max_depth", 20.0);
+    if (backend_config_.depth_completion) {
+      depth_completion_engine_path_ = resolve_depth_completion_engine_path(
+        depth_completion_engine_path_, backend_config_.width, backend_config_.height);
+#ifdef GAUSSIAN_LIC_ENABLE_TENSORRT
+      if (depth_completion_engine_path_.empty()) {
+        throw std::invalid_argument(
+                "depth_completion=true requires depth_completion_engine_path, "
+                "GAUSSIAN_LIC_SPNET_ENGINE, or a matching engine under "
+                "~/Software/TensorRT-engines");
+      }
+      std::error_code engine_error;
+      if (!std::filesystem::is_regular_file(depth_completion_engine_path_, engine_error)) {
+        throw std::invalid_argument(
+                "depth_completion engine is not a regular file: " +
+                depth_completion_engine_path_);
+      }
+#else
+      throw std::invalid_argument(
+              "depth_completion=true requires a build with "
+              "GAUSSIAN_LIC_ENABLE_TENSORRT=ON");
+#endif
+    }
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
     enable_torch_camera_conversion_ = declare_parameter<bool>("enable_torch_camera_conversion", false);
     enable_torch_gaussian_init_ = declare_parameter<bool>("enable_torch_gaussian_init", false);
@@ -233,8 +382,12 @@ public:
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
     initialize_torch_optimization_rng();
 #endif
-    backend_config_.enable_density_control =
+    const bool density_control_requested =
       declare_parameter<bool>("enable_torch_gaussian_pruning", false);
+    backend_config_.enable_non_upstream_density_control =
+      declare_parameter<bool>("enable_non_upstream_density_control", false);
+    backend_config_.enable_density_control =
+      density_control_requested && backend_config_.enable_non_upstream_density_control;
     backend_config_.prune_min_opacity =
       declare_parameter<double>("torch_gaussian_prune_min_opacity", 0.005);
     backend_config_.max_foreground_gaussians =
@@ -263,6 +416,15 @@ public:
       declare_parameter<int>("torch_gaussian_opacity_reset_interval", 0);
     backend_config_.opacity_reset_value =
       declare_parameter<double>("torch_gaussian_opacity_reset_value", 0.01);
+    if (
+      density_control_requested &&
+      !backend_config_.enable_non_upstream_density_control)
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "enable_torch_gaussian_pruning was requested but ignored: Gaussian-LIC parity mode "
+        "requires enable_non_upstream_density_control:=true for experimental pruning/densification");
+    }
     torch_gaussian_device_name_ = declare_parameter<std::string>("torch_gaussian_device", "cpu");
     gaussian_map_chunk_size_ = declare_parameter<int>("gaussian_map_chunk_size", 1024);
     gaussian_map_qos_depth_ = declare_parameter<int>("gaussian_map_qos_depth", 64);
@@ -278,6 +440,34 @@ public:
     publish_rendered_feedback_before_update_ =
       declare_parameter<bool>("publish_rendered_feedback_before_update", false);
     save_map_render_evaluation_ = declare_parameter<bool>("save_map_render_evaluation", false);
+    lpips_model_path_ = declare_parameter<std::string>("lpips_model_path", "");
+    if (save_map_render_evaluation_) {
+#ifdef GAUSSIAN_LIC_ENABLE_CUDA
+      lpips_model_path_ = resolve_lpips_model_path(lpips_model_path_);
+      std::error_code lpips_error;
+      if (!std::filesystem::is_regular_file(lpips_model_path_, lpips_error)) {
+        throw std::invalid_argument(
+                "save_map_render_evaluation=true requires a regular LPIPS model file; "
+                "set lpips_model_path or GAUSSIAN_LIC_LPIPS_MODEL");
+      }
+#else
+      throw std::invalid_argument(
+              "save_map_render_evaluation=true requires a build with "
+              "GAUSSIAN_LIC_ENABLE_CUDA=ON");
+#endif
+    }
+    auto_finalize_on_inactivity_ =
+      declare_parameter<bool>("auto_finalize_on_inactivity", false);
+    auto_finalize_inactivity_sec_ =
+      declare_parameter<double>("auto_finalize_inactivity_sec", 5.0);
+    auto_finalize_output_path_ =
+      declare_parameter<std::string>("auto_finalize_output_path", "gaussian_lic_result");
+    auto_finalize_include_skybox_ =
+      declare_parameter<bool>("auto_finalize_include_skybox", false);
+    auto_finalize_exit_ = declare_parameter<bool>("auto_finalize_exit", false);
+    if (!std::isfinite(auto_finalize_inactivity_sec_) || auto_finalize_inactivity_sec_ <= 0.0) {
+      throw std::invalid_argument("auto_finalize_inactivity_sec must be positive");
+    }
     active_profile_ = declare_parameter<std::string>("active_profile", "default");
     render_mode_ = declare_parameter<std::string>("render_mode", "debug_cpu");
     rendered_image_mode_ = declare_parameter<std::string>("rendered_image_mode", "");
@@ -297,9 +487,10 @@ public:
     points_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       pointcloud_topic_, pointcloud_qos,
       [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-        ++pointcloud_count_;
+        mark_input_received();
         {
           std::scoped_lock lock(buffer_mutex_);
+          ++pointcloud_count_;
           push_bounded(point_buf_, msg, dropped_pointcloud_count_);
         }
       });
@@ -307,9 +498,10 @@ public:
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       pose_topic_, pose_qos,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
-        ++pose_count_;
+        mark_input_received();
         {
           std::scoped_lock lock(buffer_mutex_);
+          ++pose_count_;
           push_bounded(pose_buf_, msg, dropped_pose_count_);
           if (
             rendered_feedback_source_stream_ == RenderedFeedbackSourceStream::kImagePose &&
@@ -324,9 +516,10 @@ public:
     image_sub_ = create_subscription<sensor_msgs::msg::Image>(
       image_topic_, image_qos,
       [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-        ++image_count_;
+        mark_input_received();
         {
           std::scoped_lock lock(buffer_mutex_);
+          ++image_count_;
           push_bounded(image_buf_, msg, dropped_image_count_);
           if (
             rendered_feedback_source_stream_ == RenderedFeedbackSourceStream::kImagePose &&
@@ -345,8 +538,9 @@ public:
         feedback_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
           rendered_feedback_pose_topic_, feedback_pose_qos,
           [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
-            ++image_pose_feedback_pose_messages_;
+            mark_input_received();
             std::scoped_lock lock(buffer_mutex_);
+            ++image_pose_feedback_pose_messages_;
             push_bounded(feedback_pose_buf_, msg, image_pose_feedback_pose_queue_drops_);
           });
       }
@@ -357,8 +551,9 @@ public:
         feedback_image_sub_ = create_subscription<sensor_msgs::msg::Image>(
           rendered_feedback_image_topic_, feedback_image_qos,
           [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-            ++image_pose_feedback_image_messages_;
+            mark_input_received();
             std::scoped_lock lock(buffer_mutex_);
+            ++image_pose_feedback_image_messages_;
             push_bounded(feedback_image_buf_, msg, image_pose_feedback_image_queue_drops_);
           });
       }
@@ -367,7 +562,10 @@ public:
     camera_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
       camera_info_topic_, camera_info_qos,
       [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
-        ++camera_info_count_;
+        {
+          std::scoped_lock lock(intrinsics_mutex_);
+          ++camera_info_count_;
+        }
         if (!valid_camera_info_intrinsics(*msg)) {
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
@@ -387,9 +585,10 @@ public:
     depth_sub_ = create_subscription<sensor_msgs::msg::Image>(
       depth_topic_, depth_qos,
       [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-        ++depth_count_;
+        mark_input_received();
         {
           std::scoped_lock lock(buffer_mutex_);
+          ++depth_count_;
           push_bounded(depth_buf_, msg, dropped_depth_count_);
         }
       });
@@ -397,6 +596,7 @@ public:
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       imu_topic_, imu_qos,
       [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+        std::scoped_lock lock(buffer_mutex_);
         ++imu_count_;
         last_imu_stamp_ = msg->header.stamp;
       });
@@ -414,20 +614,57 @@ public:
       gaussian_map_topic_,
       rclcpp::QoS(static_cast<size_t>(std::max(gaussian_map_qos_depth_, 1)))
       .transient_local().reliable());
+    // Sensor subscriptions deliberately stay in the node's default callback
+    // group.  GPU mapping/SaveMap and status each get their own group so a
+    // status snapshot waiting for the map mutex never prevents DDS input from
+    // being queued by the multi-threaded executor.
+    mapping_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    status_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     save_map_srv_ = create_service<gaussian_lic_msgs::srv::SaveMap>(
       save_map_service_,
       [this](
         const std::shared_ptr<gaussian_lic_msgs::srv::SaveMap::Request> request,
         std::shared_ptr<gaussian_lic_msgs::srv::SaveMap::Response> response) {
+        std::scoped_lock mapping_lock(mapping_state_mutex_);
         handle_save_map(request, response);
-      });
-    status_timer_ = create_wall_timer(1s, [this]() { publish_status(); });
+      },
+      rclcpp::ServicesQoS(),
+      mapping_callback_group_);
+    end_of_input_srv_ = create_service<std_srvs::srv::Trigger>(
+      end_of_input_service_,
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        if (!end_of_input_requested_) {
+          end_of_input_requested_ = true;
+          end_of_input_requested_steady_ns_ = steady_now_nsec();
+          RCLCPP_INFO(
+            get_logger(),
+            "end-of-input received; draining in-flight input for %.2f s before finalization",
+            auto_finalize_inactivity_sec_);
+        }
+        response->success = true;
+        response->message = auto_finalize_attempted_ ?
+          "finalization was already attempted" : "end-of-input accepted";
+      },
+      rclcpp::ServicesQoS(),
+      mapping_callback_group_);
+    status_timer_ = create_wall_timer(1s, [this]() {
+      // Status reads both mapping state and queue/drop diagnostics.  Keep the
+      // lock order identical to the mapping callback (mapping -> buffer).
+      std::scoped_lock mapping_lock(mapping_state_mutex_);
+      std::scoped_lock buffer_lock(buffer_mutex_);
+      publish_status();
+    }, status_callback_group_);
     process_timer_ = create_wall_timer(
       std::chrono::milliseconds(process_period_ms_),
       [this]() {
+        std::scoped_lock mapping_lock(mapping_state_mutex_);
         process_image_pose_rendered_feedback();
         process_available_frames();
-      });
+        maybe_finalize_after_inactivity();
+      },
+      mapping_callback_group_);
     if (publish_tf_) {
       tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     }
@@ -460,6 +697,15 @@ public:
       publish_tf_ ? "enabled" : "disabled", world_frame_.c_str(), camera_frame_.c_str());
     RCLCPP_INFO(get_logger(), "Save-map service available at %s",
       save_map_service_.c_str());
+    RCLCPP_INFO(get_logger(), "End-of-input service available at %s",
+      end_of_input_service_.c_str());
+    RCLCPP_INFO(
+      get_logger(),
+      "Inactivity finalization %s (timeout=%.2fs output=%s exit=%s)",
+      auto_finalize_on_inactivity_ ? "enabled" : "disabled",
+      auto_finalize_inactivity_sec_,
+      auto_finalize_output_path_.empty() ? "<unset>" : auto_finalize_output_path_.c_str(),
+      auto_finalize_exit_ ? "true" : "false");
     RCLCPP_INFO(get_logger(), "Frame sync tolerance %.3f sec, anchor %s, max queue %d",
       sync_tolerance_sec_, sync_anchor_stream_name_.c_str(), max_queue_size_);
     RCLCPP_INFO(get_logger(), "Depth topic synchronization %s",
@@ -541,23 +787,17 @@ public:
       backend_config_.scaling_lr, backend_config_.rotation_lr);
     if (backend_config_.depth_completion) {
 #ifdef GAUSSIAN_LIC_ENABLE_TENSORRT
-      if (depth_completion_engine_path_.empty()) {
-        RCLCPP_WARN(
-          get_logger(),
-          "depth_completion is enabled but depth_completion_engine_path is empty; using sparse/provided depth until an SPNet TensorRT engine is configured");
-      } else {
-        RCLCPP_INFO(
-          get_logger(),
-          "TensorRT/SPNet depth completion enabled with engine=%s",
-          depth_completion_engine_path_.c_str());
-      }
-#else
-      RCLCPP_WARN(
+      RCLCPP_INFO(
         get_logger(),
-        "depth_completion is configured but this build was not compiled with TensorRT/SPNet support; "
-        "using the provided or sparse-projected depth image");
+        "TensorRT/SPNet depth completion enabled with engine=%s",
+        depth_completion_engine_path_.c_str());
 #endif
     }
+  }
+
+  const std::string & terminal_failure_message() const
+  {
+    return terminal_failure_message_;
   }
 
 private:
@@ -568,6 +808,7 @@ private:
     double cx{0.5};
     double cy{0.5};
     std::string source{"params"};
+    uint64_t camera_info_count{0};
   };
 
   static std::string normalized_qos_token(std::string value)
@@ -848,7 +1089,18 @@ private:
   Intrinsics current_intrinsics() const
   {
     std::scoped_lock lock(intrinsics_mutex_);
-    return Intrinsics{fx_, fy_, cx_, cy_, intrinsics_source_};
+    return Intrinsics{fx_, fy_, cx_, cy_, intrinsics_source_, camera_info_count_};
+  }
+
+  static int64_t steady_now_nsec()
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  void mark_input_received()
+  {
+    last_input_receive_steady_ns_.store(steady_now_nsec(), std::memory_order_relaxed);
   }
 
   template<typename PtrT>
@@ -1167,17 +1419,28 @@ private:
     record.width = record.image_rgb_float.cols;
     record.height = record.image_rgb_float.rows;
     record.depth_m_float = cv::Mat(record.height, record.width, CV_32FC1, cv::Scalar(0.0F));
+    const auto intrinsics = current_intrinsics();
+    record.intrinsics = gaussian_lic_mapping::CameraIntrinsics{
+      intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy};
 
     const Eigen::Quaterniond q_w_pose{
       pose.pose.orientation.w,
       pose.pose.orientation.x,
       pose.pose.orientation.y,
       pose.pose.orientation.z};
+    const double pose_quaternion_squared_norm = q_w_pose.squaredNorm();
+    if (!std::isfinite(pose_quaternion_squared_norm) || pose_quaternion_squared_norm <= 1.0e-24) {
+      throw std::runtime_error(
+              "image-pose feedback orientation must be finite and have non-zero norm");
+    }
     const Eigen::Quaterniond q_pose_camera = camera_extrinsics_.q_pose_camera.normalized();
     const Eigen::Vector3d t_w_pose{
       pose.pose.position.x,
       pose.pose.position.y,
       pose.pose.position.z};
+    if (!t_w_pose.allFinite()) {
+      throw std::runtime_error("image-pose feedback position must be finite");
+    }
     record.r_wc = (q_w_pose.normalized() * q_pose_camera).normalized().toRotationMatrix();
     record.t_wc = t_w_pose + q_w_pose.normalized() * camera_extrinsics_.p_pose_camera;
     return record;
@@ -1291,6 +1554,16 @@ private:
           require_projected_point_color_, zbuffer_projected_points_);
         record_converted_frame(std::move(frame_data));
         record_iteration_timing(iteration_start);
+      } catch (const DepthCompletionFatalError & ex) {
+        ++conversion_error_count_;
+        RCLCPP_FATAL(
+          get_logger(),
+          "required TensorRT depth completion failed; stopping instead of changing "
+          "the configured mapping pipeline: %s", ex.what());
+        // Let the executor/container observe a failed callback.  A graceful
+        // shutdown here would make standalone main return zero and let CI
+        // mistake a broken/incompatible required engine for a successful run.
+        throw;
       } catch (const std::exception & ex) {
         ++conversion_error_count_;
         RCLCPP_WARN_THROTTLE(
@@ -1315,7 +1588,7 @@ private:
 
   void record_converted_frame(MapperFrameData && frame_data)
   {
-    maybe_complete_depth(frame_data);
+    maybe_complete_depth(frame_data, frame_data.intrinsics);
     ++converted_frame_count_;
     last_image_width_ = frame_data.width;
     last_image_height_ = frame_data.height;
@@ -1324,6 +1597,7 @@ private:
     last_depth_m_float_ = frame_data.depth_m_float.clone();
     last_q_wc_ = frame_data.q_wc;
     last_t_wc_ = frame_data.t_wc;
+    last_intrinsics_ = frame_data.intrinsics;
     const auto frame_stamp = frame_data.stamp;
     publish_tracking_outputs(frame_data);
     const auto & record = dataset_.add_frame(std::move(frame_data), static_cast<size_t>(test_frame_stride_));
@@ -1334,11 +1608,11 @@ private:
       publish_rendered_preview_for_record(frame_stamp, record);
     }
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
-    const auto intrinsics = current_intrinsics();
     if (enable_torch_camera_conversion_) {
       try {
         const auto camera = gaussian_lic_mapping::make_torch_camera(
-          record, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, torch::kCPU, torch::kCPU);
+          record, record.intrinsics.fx, record.intrinsics.fy,
+          record.intrinsics.cx, record.intrinsics.cy, torch::kCPU, torch::kCPU);
         ++torch_camera_count_;
         std::ostringstream image_dims;
         std::ostringstream depth_dims;
@@ -1358,6 +1632,10 @@ private:
     if (!publish_rendered_feedback_before_update_ && rendered_feedback_from_aligned_frames()) {
       publish_rendered_preview_for_record(frame_stamp, record);
     }
+    last_converted_frame_steady_ns_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(),
+      std::memory_order_relaxed);
   }
 
   void publish_rendered_preview_for_record(
@@ -1383,21 +1661,16 @@ private:
     }
   }
 
-  void maybe_complete_depth(MapperFrameData & frame_data)
+  void maybe_complete_depth(
+    MapperFrameData & frame_data,
+    const gaussian_lic_mapping::CameraIntrinsics & intrinsics)
   {
-    if (!backend_config_.depth_completion) {
+    // Match ROS1 Dataset::addFrame: SPNet is a keyframe-only point seeding
+    // stage.  It must never replace the sparse training depth image.
+    if (!backend_config_.depth_completion || !frame_data.is_keyframe) {
       return;
     }
 #ifdef GAUSSIAN_LIC_ENABLE_TENSORRT
-    if (depth_completion_engine_path_.empty()) {
-      if (!depth_completion_missing_engine_warned_) {
-        depth_completion_missing_engine_warned_ = true;
-        RCLCPP_WARN(
-          get_logger(),
-          "TensorRT depth completion requested without depth_completion_engine_path; keeping sparse/provided depth");
-      }
-      return;
-    }
     try {
       if (
         !depth_completer_ ||
@@ -1409,22 +1682,32 @@ private:
         depth_completer_width_ = frame_data.width;
         depth_completer_height_ = frame_data.height;
       }
-      frame_data.depth_m_float = depth_completer_->complete(
+      const cv::Mat completed_depth = depth_completer_->complete(
         frame_data.image_rgb_float, frame_data.depth_m_float);
       ++depth_completion_count_;
+      const gaussian_lic_mapping::DepthCompletionResult result =
+        gaussian_lic_mapping::append_depth_completion_points(
+        frame_data, completed_depth, intrinsics,
+        backend_config_.patch_size, backend_config_.max_depth);
+      if (result.accepted) {
+        ++depth_completion_accepted_count_;
+      } else {
+        ++depth_completion_rejected_bias_count_;
+      }
+      depth_completion_appended_point_count_ +=
+        static_cast<uint64_t>(result.appended_point_count);
+      depth_completion_rejected_max_depth_point_count_ +=
+        static_cast<uint64_t>(result.rejected_max_depth_count);
+      last_depth_completion_mean_difference_m_ =
+        result.mean_known_depth_difference_m;
+      last_depth_completion_appended_point_count_ = result.appended_point_count;
     } catch (const std::exception & ex) {
       ++depth_completion_error_count_;
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "TensorRT depth completion failed: %s", ex.what());
+      throw DepthCompletionFatalError(ex.what());
     }
 #else
-    if (!depth_completion_missing_engine_warned_) {
-      depth_completion_missing_engine_warned_ = true;
-      RCLCPP_WARN(
-        get_logger(),
-        "TensorRT depth completion requested, but this build was not compiled with GAUSSIAN_LIC_ENABLE_TENSORRT=ON");
-    }
+    throw DepthCompletionFatalError(
+            "mapping_node was not compiled with GAUSSIAN_LIC_ENABLE_TENSORRT=ON");
 #endif
   }
 
@@ -1458,7 +1741,6 @@ private:
 
   void maybe_optimize_torch_gaussians(
     const gaussian_lic_mapping::CameraFrameRecord & record,
-    const Intrinsics & intrinsics,
     const torch::Device & device)
   {
     if (
@@ -1477,7 +1759,7 @@ private:
     }
 
     try {
-      const auto result = optimize_torch_gaussian_training_set(record, intrinsics, device);
+      const auto result = optimize_torch_gaussian_training_set(record, device);
       last_torch_optimization_supervised_ = result.supervised_count;
       last_torch_optimization_loss_ = result.photometric_l1;
       if (result.steps > 0) {
@@ -1504,7 +1786,6 @@ private:
 
   gaussian_lic_mapping::TorchOptimizationResult optimize_torch_gaussian_training_set(
     const gaussian_lic_mapping::CameraFrameRecord & latest_record,
-    const Intrinsics & intrinsics,
     const torch::Device & device)
   {
     gaussian_lic_mapping::TorchOptimizationResult total;
@@ -1513,15 +1794,16 @@ private:
       return total;
     }
 
-    const size_t sample_count = std::min(
-      static_cast<size_t>(std::max(backend_config_.optimization_steps_per_keyframe, 1)),
-      train_frames.size());
+    const size_t sample_count = static_cast<size_t>(
+      std::max(backend_config_.optimization_steps_per_keyframe, 1));
     const auto sample_indices = select_torch_optimization_frames(
       train_frames, latest_record, sample_count);
 
     for (const size_t index : sample_indices) {
+      const auto & frame = train_frames[index];
       const auto camera = gaussian_lic_mapping::make_torch_camera(
-        train_frames[index], intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, device, device);
+        frame, frame.intrinsics.fx, frame.intrinsics.fy,
+        frame.intrinsics.cx, frame.intrinsics.cy, device, device);
       const auto result = gaussian_lic_mapping::optimize_gaussian_map_from_camera(
         torch_gaussian_map_, camera, backend_config_, 1, device);
       total.steps += result.steps;
@@ -1571,7 +1853,8 @@ private:
       return select_upstream_random_optimization_frames(train_frames, sample_count);
     }
     if (mode == "even" || mode == "latest_even" || mode == "deterministic_even") {
-      return select_even_optimization_frames(train_frames, latest_record, sample_count, mode != "even");
+      return select_even_optimization_frames(
+        train_frames, latest_record, std::min(sample_count, train_frames.size()), mode != "even");
     }
 
     RCLCPP_WARN_THROTTLE(
@@ -1585,40 +1868,14 @@ private:
     const std::vector<gaussian_lic_mapping::CameraFrameRecord> & train_frames,
     const size_t sample_count)
   {
-    std::vector<size_t> all_indices(train_frames.size());
-    std::iota(all_indices.begin(), all_indices.end(), 0U);
-
-    std::vector<size_t> sample_indices;
-    sample_indices.reserve(sample_count);
-    if (train_frames.size() <= sample_count) {
-      sample_indices = all_indices;
-    } else if (backend_config_.iteration_decay && should_decay_torch_optimization_list(train_frames)) {
-      const size_t split = train_frames.size() * 2U / 3U;
-      const size_t first_count = std::min(sample_count / 2U, split);
-      const size_t second_count = std::min(sample_count - first_count, train_frames.size() - split);
-      std::sample(
-        all_indices.begin(), all_indices.begin() + static_cast<std::ptrdiff_t>(split),
-        std::back_inserter(sample_indices), first_count, torch_optimization_rng_);
-      std::sample(
-        all_indices.begin() + static_cast<std::ptrdiff_t>(split), all_indices.end(),
-        std::back_inserter(sample_indices), second_count, torch_optimization_rng_);
-    } else {
-      std::sample(
-        all_indices.begin(), all_indices.end(), std::back_inserter(sample_indices),
-        sample_count, torch_optimization_rng_);
+    std::vector<Eigen::Vector3d> camera_positions;
+    camera_positions.reserve(train_frames.size());
+    for (const auto & frame : train_frames) {
+      camera_positions.push_back(frame.t_wc);
     }
-
-    std::shuffle(sample_indices.begin(), sample_indices.end(), torch_optimization_rng_);
-    return sample_indices;
-  }
-
-  bool should_decay_torch_optimization_list(
-    const std::vector<gaussian_lic_mapping::CameraFrameRecord> & train_frames) const
-  {
-    if (train_frames.size() < 2U) {
-      return false;
-    }
-    return (train_frames.back().t_wc - train_frames.front().t_wc).norm() > 120.0;
+    return gaussian_lic_mapping::select_upstream_random_optimization_indices(
+      camera_positions, sample_count, backend_config_.iteration_decay,
+      torch_optimization_rng_);
   }
 
   std::vector<size_t> select_even_optimization_frames(
@@ -1732,6 +1989,7 @@ private:
   {
     if (
       !torch_gaussian_initialized_ ||
+      !backend_config_.enable_density_control ||
       backend_config_.opacity_reset_interval <= 0 ||
       torch_gaussian_optimization_step_count_ == 0 ||
       torch_gaussian_optimization_step_count_ - last_torch_opacity_reset_step_ <
@@ -1773,7 +2031,7 @@ private:
     }
 
     try {
-      const auto intrinsics = current_intrinsics();
+      const auto & intrinsics = record.intrinsics;
       const auto device = resolve_torch_gaussian_device();
       if (!torch_gaussian_initialized_) {
         torch_gaussian_map_ = gaussian_lic_mapping::initialize_gaussian_map(
@@ -1784,7 +2042,7 @@ private:
         refresh_torch_gaussian_status(device);
 
         dataset_.clear_pending_points();
-        maybe_optimize_torch_gaussians(record, intrinsics, device);
+        maybe_optimize_torch_gaussians(record, device);
         maybe_densify_torch_gaussians(device);
         maybe_prune_torch_gaussians(device);
         maybe_reset_torch_gaussian_opacity(device);
@@ -1811,7 +2069,7 @@ private:
       ++torch_gaussian_extend_count_;
       refresh_torch_gaussian_status(device);
       dataset_.clear_pending_points();
-      maybe_optimize_torch_gaussians(record, intrinsics, device);
+      maybe_optimize_torch_gaussians(record, device);
       maybe_densify_torch_gaussians(device);
       maybe_prune_torch_gaussians(device);
       maybe_reset_torch_gaussian_opacity(device);
@@ -1961,13 +2219,13 @@ private:
       throw std::runtime_error("Gaussian map has no foreground points to save");
     }
 
-    std::ofstream out(output_path);
+    std::ofstream out(output_path, std::ios::binary);
     if (!out.is_open()) {
       throw std::runtime_error("failed to open " + output_path.string());
     }
 
     out << "ply\n";
-    out << "format ascii 1.0\n";
+    out << "format binary_little_endian 1.0\n";
     out << "element vertex " << point_count << "\n";
     out << "property float x\n";
     out << "property float y\n";
@@ -1986,7 +2244,6 @@ private:
       out << "property float rot_" << i << "\n";
     }
     out << "end_header\n";
-    out << std::setprecision(9);
 
     const auto xyz_a = xyz.accessor<float, 2>();
     const auto dc_a = features_dc.accessor<float, 2>();
@@ -1995,22 +2252,29 @@ private:
     const auto scaling_a = scaling.accessor<float, 2>();
     const auto rotation_a = rotation.accessor<float, 2>();
 
+    auto write_float = [&out](const float value) {
+        out.write(reinterpret_cast<const char *>(&value), sizeof(value));
+      };
     for (int64_t row = 0; row < point_count; ++row) {
-      out << xyz_a[row][0] << " " << xyz_a[row][1] << " " << xyz_a[row][2];
+      write_float(xyz_a[row][0]);
+      write_float(xyz_a[row][1]);
+      write_float(xyz_a[row][2]);
       for (int64_t i = 0; i < features_dc.size(1); ++i) {
-        out << " " << dc_a[row][i];
+        write_float(dc_a[row][i]);
       }
       for (int64_t i = 0; i < features_rest.size(1); ++i) {
-        out << " " << rest_a[row][i];
+        write_float(rest_a[row][i]);
       }
-      out << " " << opacity_a[row][0];
+      write_float(opacity_a[row][0]);
       for (int64_t i = 0; i < scaling.size(1); ++i) {
-        out << " " << scaling_a[row][i];
+        write_float(scaling_a[row][i]);
       }
       for (int64_t i = 0; i < rotation.size(1); ++i) {
-        out << " " << rotation_a[row][i];
+        write_float(rotation_a[row][i]);
       }
-      out << "\n";
+    }
+    if (!out.good()) {
+      throw std::runtime_error("failed while writing binary Gaussian PLY " + output_path.string());
     }
   }
 
@@ -2032,6 +2296,75 @@ private:
     cv::Mat bgr;
     cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
     return bgr.clone();
+  }
+
+  struct RenderQualityMetrics
+  {
+    double l1{0.0};
+    double mse{0.0};
+    double psnr{0.0};
+    double ssim{0.0};
+  };
+
+  static RenderQualityMetrics calculate_render_quality(
+    torch::Tensor rendered_rgb,
+    torch::Tensor ground_truth_rgb)
+  {
+    if (
+      !rendered_rgb.defined() || !ground_truth_rgb.defined() ||
+      rendered_rgb.dim() != 3 || ground_truth_rgb.dim() != 3 ||
+      rendered_rgb.size(0) != 3 || ground_truth_rgb.size(0) != 3 ||
+      rendered_rgb.sizes() != ground_truth_rgb.sizes())
+    {
+      throw std::runtime_error("render-quality inputs must be same-sized [3, H, W] tensors");
+    }
+
+    torch::NoGradGuard no_grad;
+    rendered_rgb = rendered_rgb.clamp(0.0F, 1.0F);
+    ground_truth_rgb = ground_truth_rgb.to(rendered_rgb.device()).clamp(0.0F, 1.0F);
+    const auto difference = rendered_rgb - ground_truth_rgb;
+    RenderQualityMetrics metrics;
+    metrics.l1 = difference.abs().mean().item<double>();
+    metrics.mse = difference.square().mean().item<double>();
+    metrics.psnr = -10.0 * std::log10(std::max(metrics.mse, 1.0e-12));
+
+    constexpr int64_t window_size = 11;
+    std::vector<float> gaussian_values(static_cast<size_t>(window_size));
+    for (int64_t x = 0; x < window_size; ++x) {
+      const int64_t centered = x - window_size / 2;
+      gaussian_values[static_cast<size_t>(x)] = std::exp(
+        -static_cast<float>(centered * centered) / (2.0F * 1.5F * 1.5F));
+    }
+    auto gaussian_1d = torch::tensor(
+      gaussian_values, torch::TensorOptions().dtype(torch::kFloat32)).to(rendered_rgb.options());
+    gaussian_1d = gaussian_1d / gaussian_1d.sum();
+    const auto window = gaussian_1d.unsqueeze(1).mm(gaussian_1d.unsqueeze(0))
+      .unsqueeze(0).unsqueeze(0).expand({3, 1, window_size, window_size}).contiguous();
+    const auto conv_options = torch::nn::functional::Conv2dFuncOptions()
+      .padding(window_size / 2).groups(3);
+    const auto rendered_batch = rendered_rgb.unsqueeze(0);
+    const auto ground_truth_batch = ground_truth_rgb.unsqueeze(0);
+    const auto mu_rendered = torch::nn::functional::conv2d(
+      rendered_batch, window, conv_options);
+    const auto mu_ground_truth = torch::nn::functional::conv2d(
+      ground_truth_batch, window, conv_options);
+    const auto mu_rendered_sq = mu_rendered.square();
+    const auto mu_ground_truth_sq = mu_ground_truth.square();
+    const auto mu_product = mu_rendered * mu_ground_truth;
+    const auto sigma_rendered_sq = torch::nn::functional::conv2d(
+      rendered_batch.square(), window, conv_options) - mu_rendered_sq;
+    const auto sigma_ground_truth_sq = torch::nn::functional::conv2d(
+      ground_truth_batch.square(), window, conv_options) - mu_ground_truth_sq;
+    const auto sigma_product = torch::nn::functional::conv2d(
+      rendered_batch * ground_truth_batch, window, conv_options) - mu_product;
+    constexpr double c1 = 0.01 * 0.01;
+    constexpr double c2 = 0.03 * 0.03;
+    const auto ssim_map =
+      ((2.0 * mu_product + c1) * (2.0 * sigma_product + c2)) /
+      ((mu_rendered_sq + mu_ground_truth_sq + c1) *
+      (sigma_rendered_sq + sigma_ground_truth_sq + c2));
+    metrics.ssim = ssim_map.mean().item<double>();
+    return metrics;
   }
 
   static cv::Mat rgb_float_image_to_bgr8(const cv::Mat & image_rgb_float)
@@ -2092,17 +2425,54 @@ private:
     }
 
     const auto render_dir = output_dir / "renders";
+    const auto upstream_render_dir = output_dir / "render";
     const auto gt_dir = output_dir / "gt";
     const auto depth_dir = output_dir / "render_depth";
+    auto remove_evaluation_artifact = [] (const std::filesystem::path & path) {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+        if (error) {
+          throw std::runtime_error(
+                  "failed to remove stale evaluation artifact " + path.string() +
+                  ": " + error.message());
+        }
+      };
+    remove_evaluation_artifact(render_dir);
+    remove_evaluation_artifact(upstream_render_dir);
+    remove_evaluation_artifact(gt_dir);
+    remove_evaluation_artifact(depth_dir);
+    remove_evaluation_artifact(output_dir / "render_manifest.json");
     std::filesystem::create_directories(render_dir);
     std::filesystem::create_directories(gt_dir);
     std::filesystem::create_directories(depth_dir);
+    std::error_code alias_error;
+    std::filesystem::create_directory_symlink(
+      render_dir.filename(), upstream_render_dir, alias_error);
+    const bool write_upstream_render_copy = static_cast<bool>(alias_error);
+    if (write_upstream_render_copy) {
+      std::filesystem::create_directories(upstream_render_dir);
+    }
 
-    const auto intrinsics = current_intrinsics();
     const auto device = resolve_torch_gaussian_device();
     if (!device.is_cuda()) {
       throw std::runtime_error(
         "final render evaluation requires torch_gaussian_device=cuda or auto resolving to CUDA");
+    }
+
+    std::optional<torch::jit::script::Module> lpips_model;
+    std::filesystem::path resolved_lpips_path;
+    if (!lpips_model_path_.empty()) {
+      resolved_lpips_path = std::filesystem::path(lpips_model_path_);
+      if (std::filesystem::is_directory(resolved_lpips_path)) {
+        resolved_lpips_path /= "lpips_alex.pt";
+      }
+      if (!std::filesystem::is_regular_file(resolved_lpips_path)) {
+        throw std::runtime_error(
+                "LPIPS model does not exist: " + resolved_lpips_path.string());
+      }
+      lpips_model.emplace(torch::jit::load(resolved_lpips_path.string()));
+      lpips_model->to(device);
+      lpips_model->eval();
     }
 
     std::ofstream manifest(output_dir / "render_manifest.json");
@@ -2110,17 +2480,41 @@ private:
       throw std::runtime_error("failed to open final render manifest");
     }
     manifest << "{\n";
-    manifest << "  \"schema\": \"gaussian_lic_ros2_final_render/v1\",\n";
-    manifest << "  \"device\": \"" << device.str() << "\",\n";
+    manifest << "  \"schema\": \"gaussian_lic_ros2_final_render/v3\",\n";
+    manifest << "  \"device\": \"" << json_escape(device.str()) << "\",\n";
+    manifest << "  \"lpips_model\": ";
+    if (lpips_model) {
+      manifest << "\"" << json_escape(resolved_lpips_path.string()) << "\",\n";
+    } else {
+      manifest << "null,\n";
+    }
     manifest << "  \"train_frame_count\": " << dataset_.train_frame_count() << ",\n";
     manifest << "  \"test_frame_count\": " << dataset_.test_frame_count() << ",\n";
     manifest << "  \"frames\": [\n";
 
+    struct EvaluationAggregate
+    {
+      size_t count{0};
+      size_t lpips_count{0};
+      double l1{0.0};
+      double mse{0.0};
+      double psnr{0.0};
+      double ssim{0.0};
+      double lpips{0.0};
+    };
+    EvaluationAggregate all_aggregate;
+    EvaluationAggregate train_aggregate;
+    EvaluationAggregate test_aggregate;
     size_t written = 0;
-    auto render_frame = [&](const gaussian_lic_mapping::CameraFrameRecord & frame) {
+    auto render_frame = [&] (
+      const gaussian_lic_mapping::CameraFrameRecord & frame,
+      const char * split,
+      EvaluationAggregate & split_aggregate)
+      {
       torch::NoGradGuard no_grad;
       const auto camera = gaussian_lic_mapping::make_torch_camera(
-        frame, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, device, device);
+        frame, frame.intrinsics.fx, frame.intrinsics.fy,
+        frame.intrinsics.cx, frame.intrinsics.cy, device, device);
       const auto render_result = gaussian_lic_mapping::render_gaussian_map_from_camera(
         torch_gaussian_map_, camera, backend_config_, device);
       if (!render_result.rendered_image.defined()) {
@@ -2130,8 +2524,15 @@ private:
       const auto render_path = render_dir / frame.image_name;
       const auto gt_path = gt_dir / frame.image_name;
       const auto depth_path = depth_dir / frame.image_name;
-      if (!cv::imwrite(render_path.string(), torch_rgb_image_to_bgr8(render_result.rendered_image))) {
+      const cv::Mat rendered_bgr = torch_rgb_image_to_bgr8(render_result.rendered_image);
+      if (!cv::imwrite(render_path.string(), rendered_bgr)) {
         throw std::runtime_error("failed to write " + render_path.string());
+      }
+      if (write_upstream_render_copy) {
+        const auto upstream_render_path = upstream_render_dir / frame.image_name;
+        if (!cv::imwrite(upstream_render_path.string(), rendered_bgr)) {
+          throw std::runtime_error("failed to write " + upstream_render_path.string());
+        }
       }
       if (!cv::imwrite(gt_path.string(), rgb_float_image_to_bgr8(frame.image_rgb_float))) {
         throw std::runtime_error("failed to write " + gt_path.string());
@@ -2142,27 +2543,90 @@ private:
         throw std::runtime_error("failed to write " + depth_path.string());
       }
 
+      const auto rendered_image = render_result.rendered_image.clamp(0.0F, 1.0F);
+      const auto ground_truth_image = camera.original_image.to(device).clamp(0.0F, 1.0F);
+      const RenderQualityMetrics quality = calculate_render_quality(
+        rendered_image, ground_truth_image);
+      std::optional<double> lpips;
+      if (lpips_model) {
+        std::vector<torch::jit::IValue> inputs;
+        inputs.emplace_back(rendered_image.unsqueeze(0));
+        inputs.emplace_back(ground_truth_image.unsqueeze(0));
+        lpips = lpips_model->forward(inputs).toTensor().item<double>();
+      }
+      auto add_metrics = [&] (EvaluationAggregate & aggregate) {
+          ++aggregate.count;
+          aggregate.l1 += quality.l1;
+          aggregate.mse += quality.mse;
+          aggregate.psnr += quality.psnr;
+          aggregate.ssim += quality.ssim;
+          if (lpips) {
+            ++aggregate.lpips_count;
+            aggregate.lpips += *lpips;
+          }
+        };
+      add_metrics(split_aggregate);
+      add_metrics(all_aggregate);
+
       if (written > 0) {
         manifest << ",\n";
       }
-      manifest << "    {\"name\": \"" << frame.image_name << "\", "
+      manifest << "    {\"name\": \"" << json_escape(frame.image_name) << "\", "
+               << "\"split\": \"" << json_escape(split) << "\", "
                << "\"frame_index\": " << frame.frame_index << ", "
                << "\"is_keyframe\": " << (frame.is_keyframe ? "true" : "false") << ", "
                << "\"stamp_sec\": " << frame.stamp.sec << ", "
                << "\"stamp_nanosec\": " << frame.stamp.nanosec << ", "
-               << "\"visible_count\": " << render_result.visible_count << "}";
+               << "\"visible_count\": " << render_result.visible_count << ", "
+               << "\"l1\": " << quality.l1 << ", "
+               << "\"mse\": " << quality.mse << ", "
+               << "\"psnr\": " << quality.psnr << ", "
+               << "\"ssim\": " << quality.ssim << ", "
+               << "\"lpips\": ";
+      if (lpips) {
+        manifest << *lpips;
+      } else {
+        manifest << "null";
+      }
+      manifest << "}";
       ++written;
     };
 
     for (const auto & frame : dataset_.train_frames()) {
-      render_frame(frame);
+      render_frame(frame, "train", train_aggregate);
     }
     for (const auto & frame : dataset_.test_frames()) {
-      render_frame(frame);
+      render_frame(frame, "test", test_aggregate);
     }
     manifest << "\n  ],\n";
-    manifest << "  \"written\": " << written << "\n";
+    manifest << "  \"written\": " << written << ",\n";
+    auto write_aggregate = [&manifest] (
+      const char * name, const EvaluationAggregate & aggregate, const bool trailing_comma)
+      {
+        const double denominator = static_cast<double>(std::max<size_t>(aggregate.count, 1U));
+        manifest << "    \"" << name << "\": {\"count\": " << aggregate.count
+                 << ", \"mean_l1\": " << aggregate.l1 / denominator
+                 << ", \"mean_mse\": " << aggregate.mse / denominator
+                 << ", \"mean_psnr\": " << aggregate.psnr / denominator
+                 << ", \"mean_ssim\": " << aggregate.ssim / denominator
+                 << ", \"mean_lpips\": ";
+        if (aggregate.lpips_count > 0U) {
+          manifest << aggregate.lpips / static_cast<double>(aggregate.lpips_count);
+        } else {
+          manifest << "null";
+        }
+        manifest << "}" << (trailing_comma ? "," : "") << "\n";
+      };
+    manifest << "  \"metrics\": {\n";
+    write_aggregate("all", all_aggregate, true);
+    write_aggregate("train", train_aggregate, true);
+    write_aggregate("test", test_aggregate, false);
+    manifest << "  }\n";
     manifest << "}\n";
+    manifest.flush();
+    if (!manifest) {
+      throw std::runtime_error("failed to write final render evaluation manifest");
+    }
     RCLCPP_INFO(
       get_logger(), "Wrote final Gaussian render evaluation frames: %zu to %s",
       written, output_dir.string().c_str());
@@ -2227,6 +2691,10 @@ private:
           << static_cast<int>(color_channel_to_u8(color.y())) << " "
           << static_cast<int>(color_channel_to_u8(color.z())) << "\n";
     }
+    out.flush();
+    if (!out) {
+      throw std::runtime_error("failed to write " + output_path.string());
+    }
   }
 
   void handle_save_map(
@@ -2242,6 +2710,12 @@ private:
         response->success = true;
         response->message = "saved Gaussian map to " + output_path.string();
         return;
+      }
+
+      if (save_map_render_evaluation_) {
+        throw std::runtime_error(
+                "final Gaussian save/evaluation was requested, but the Gaussian map "
+                "was not initialized");
       }
 
       write_debug_map_points_ply(output_path);
@@ -2262,6 +2736,178 @@ private:
       response->message = ex.what();
     }
 #endif
+  }
+
+  void write_finalize_manifest(
+    const std::filesystem::path & output_path,
+    const std::string & save_message) const
+  {
+    const auto map_path = resolve_debug_map_path(output_path.string());
+    std::ofstream manifest(map_path.parent_path() / "finalize_manifest.json");
+    if (!manifest.is_open()) {
+      throw std::runtime_error("failed to open inactivity finalize manifest");
+    }
+    manifest << "{\n";
+    manifest << "  \"schema\": \"gaussian_lic_ros2_finalize/v1\",\n";
+    manifest << "  \"success\": true,\n";
+    manifest << "  \"map_path\": \"" << json_escape(map_path.string()) << "\",\n";
+    manifest << "  \"message\": \"" << json_escape(save_message) << "\",\n";
+    manifest << "  \"all_frames\": " << dataset_.all_frame_count() << ",\n";
+    manifest << "  \"train_frames\": " << dataset_.train_frame_count() << ",\n";
+    manifest << "  \"test_frames\": " << dataset_.test_frame_count() << ",\n";
+    manifest << "  \"gaussians\": " << torch_gaussian_count_ << ",\n";
+    manifest << "  \"depth_completion_inference_count\": "
+             << depth_completion_count_ << ",\n";
+    manifest << "  \"depth_completion_accepted_count\": "
+             << depth_completion_accepted_count_ << ",\n";
+    manifest << "  \"depth_completion_appended_points\": "
+             << depth_completion_appended_point_count_ << ",\n";
+    manifest << "  \"render_evaluation_requested\": "
+             << (save_map_render_evaluation_ ? "true" : "false") << "\n";
+    manifest << "}\n";
+    manifest.flush();
+    if (!manifest) {
+      throw std::runtime_error("failed to write inactivity finalize manifest");
+    }
+  }
+
+  void terminate_with_failure(const std::string & reason)
+  {
+    if (!terminal_failure_message_.empty()) {
+      return;
+    }
+    terminal_failure_message_ = reason;
+    RCLCPP_FATAL(get_logger(), "terminal mapping failure: %s", reason.c_str());
+#ifdef GAUSSIAN_LIC_MAPPING_COMPOSITION
+    // A component has no package main() from which to return a failure code.
+    // Propagating out of its executor makes the container fail non-zero.
+    throw std::runtime_error(reason);
+#else
+    // Standalone mode records the reason and stops the executor gracefully;
+    // main() reads the reason after spin() and returns 1 deterministically.
+    rclcpp::shutdown(get_node_base_interface()->get_context());
+#endif
+  }
+
+  void maybe_finalize_after_inactivity()
+  {
+    if (auto_finalize_attempted_) {
+      return;
+    }
+
+    const int64_t last_input_ns =
+      last_input_receive_steady_ns_.load(std::memory_order_relaxed);
+    const int64_t last_converted_ns =
+      last_converted_frame_steady_ns_.load(std::memory_order_relaxed);
+    int64_t last_activity_ns = std::max(last_input_ns, last_converted_ns);
+    if (end_of_input_requested_) {
+      // The bag process can exit before the final DDS samples reach this
+      // process.  Treat the end notification as activity and extend the drain
+      // window whenever a later sample or conversion arrives.
+      last_activity_ns = std::max(last_activity_ns, end_of_input_requested_steady_ns_);
+    } else if (!auto_finalize_on_inactivity_ || last_activity_ns <= 0) {
+      return;
+    }
+
+    const int64_t now_ns = steady_now_nsec();
+    const int64_t timeout_ns = static_cast<int64_t>(
+      auto_finalize_inactivity_sec_ * 1.0e9);
+    if (now_ns - last_activity_ns < timeout_ns) {
+      return;
+    }
+
+    size_t orphaned_pointclouds = 0U;
+    size_t orphaned_poses = 0U;
+    size_t orphaned_images = 0U;
+    size_t orphaned_depths = 0U;
+    size_t orphaned_feedback_poses = 0U;
+    size_t orphaned_feedback_images = 0U;
+    {
+      std::scoped_lock buffer_lock(buffer_mutex_);
+      int64_t current_activity_ns = std::max(
+        last_input_receive_steady_ns_.load(std::memory_order_relaxed),
+        last_converted_frame_steady_ns_.load(std::memory_order_relaxed));
+      if (end_of_input_requested_) {
+        current_activity_ns = std::max(current_activity_ns, end_of_input_requested_steady_ns_);
+      }
+      if (current_activity_ns != last_activity_ns) {
+        return;
+      }
+      // The mapping/feedback loops have had a full inactivity interval to
+      // consume every alignable job.  What remains cannot form a complete
+      // frame, so drain it explicitly and account for every orphan.
+      orphaned_pointclouds = point_buf_.size();
+      orphaned_poses = pose_buf_.size();
+      orphaned_images = image_buf_.size();
+      orphaned_depths = depth_buf_.size();
+      orphaned_feedback_poses = feedback_pose_buf_.size();
+      orphaned_feedback_images = feedback_image_buf_.size();
+      dropped_pointcloud_count_ += orphaned_pointclouds;
+      dropped_pose_count_ += orphaned_poses;
+      dropped_image_count_ += orphaned_images;
+      dropped_depth_count_ += orphaned_depths;
+      image_pose_feedback_pose_queue_drops_ += orphaned_feedback_poses;
+      image_pose_feedback_image_queue_drops_ += orphaned_feedback_images;
+      point_buf_.clear();
+      pose_buf_.clear();
+      image_buf_.clear();
+      depth_buf_.clear();
+      feedback_pose_buf_.clear();
+      feedback_image_buf_.clear();
+    }
+
+    const size_t orphaned_total = orphaned_pointclouds + orphaned_poses + orphaned_images +
+      orphaned_depths + orphaned_feedback_poses + orphaned_feedback_images;
+    if (orphaned_total > 0U) {
+      RCLCPP_WARN(
+        get_logger(),
+        "drained %zu orphaned messages before inactivity finalization "
+        "(points=%zu pose=%zu image=%zu depth=%zu feedback_pose=%zu feedback_image=%zu)",
+        orphaned_total, orphaned_pointclouds, orphaned_poses, orphaned_images,
+        orphaned_depths, orphaned_feedback_poses, orphaned_feedback_images);
+    }
+
+    auto_finalize_attempted_ = true;
+    if (converted_frame_count_ == 0U) {
+      terminate_with_failure(
+        end_of_input_requested_ ?
+        "end of input reached without a complete mapping frame" :
+        "input became inactive without a complete mapping frame");
+      return;
+    }
+    if (auto_finalize_output_path_.empty()) {
+      terminate_with_failure(
+        "automatic finalization was triggered, but auto_finalize_output_path is empty");
+      return;
+    }
+
+    auto request = std::make_shared<gaussian_lic_msgs::srv::SaveMap::Request>();
+    auto response = std::make_shared<gaussian_lic_msgs::srv::SaveMap::Response>();
+    request->path = auto_finalize_output_path_;
+    request->include_skybox = auto_finalize_include_skybox_;
+    handle_save_map(request, response);
+    if (!response->success) {
+      terminate_with_failure("automatic finalization failed: " + response->message);
+      return;
+    }
+
+    try {
+      write_finalize_manifest(auto_finalize_output_path_, response->message);
+      auto_finalize_completed_ = true;
+      RCLCPP_INFO(
+        get_logger(), "inactivity finalization complete: %s", response->message.c_str());
+    } catch (const std::exception & ex) {
+      terminate_with_failure(
+        std::string("map saved but finalize manifest failed: ") + ex.what());
+      return;
+    }
+
+    if (auto_finalize_exit_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "auto_finalize_exit requested clean exit after finalization; shutting down ROS context");
+      rclcpp::shutdown(get_node_base_interface()->get_context());
+    }
   }
 
   sensor_msgs::msg::PointCloud2 make_map_points_message(
@@ -2449,7 +3095,7 @@ private:
       return fallback_to_input ? make_input_preview_message(stamp) : image;
     }
 
-    const auto intrinsics = current_intrinsics();
+    const auto & intrinsics = last_intrinsics_;
     const Eigen::Matrix3d r_cw = last_q_wc_.toRotationMatrix().transpose();
     std::vector<float> z_buffer(static_cast<size_t>(image.width) * image.height,
       std::numeric_limits<float>::infinity());
@@ -2534,7 +3180,7 @@ private:
     const auto dc_a = features_dc.accessor<float, 3>();
     const auto scaling_a = scaling.accessor<float, 2>();
     const auto opacity_a = opacity.accessor<float, 2>();
-    const auto intrinsics = current_intrinsics();
+    const auto & intrinsics = last_intrinsics_;
     const Eigen::Matrix3d r_cw = last_q_wc_.toRotationMatrix().transpose();
     std::vector<float> z_buffer(static_cast<size_t>(image.width) * image.height,
       std::numeric_limits<float>::infinity());
@@ -2637,6 +3283,7 @@ private:
     frame.depth_m_float = depth.clone();
     frame.r_wc = last_q_wc_.toRotationMatrix();
     frame.t_wc = last_t_wc_;
+    frame.intrinsics = last_intrinsics_;
 
     return make_cuda_torch_gaussian_preview_message_for_record(stamp, device, frame);
   }
@@ -2653,10 +3300,10 @@ private:
       return make_blank_rendered_image_message(stamp, frame.width, frame.height);
     }
 
-    const auto intrinsics = current_intrinsics();
     torch::NoGradGuard no_grad;
     const auto camera = gaussian_lic_mapping::make_torch_camera(
-      frame, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy, device, device);
+      frame, frame.intrinsics.fx, frame.intrinsics.fy,
+      frame.intrinsics.cx, frame.intrinsics.cy, device, device);
     const auto render_result = gaussian_lic_mapping::render_gaussian_map_from_camera(
       torch_gaussian_map_, camera, backend_config_, device);
     if (render_result.visible_count == 0 || !render_result.rendered_image.defined()) {
@@ -2833,19 +3480,17 @@ private:
     size_t q_depth = 0;
     size_t q_feedback_pose = 0;
     size_t q_feedback_image = 0;
-    {
-      std::scoped_lock lock(buffer_mutex_);
-      q_points = point_buf_.size();
-      q_pose = pose_buf_.size();
-      q_image = image_buf_.size();
-      q_depth = depth_buf_.size();
-      q_feedback_pose = feedback_pose_buf_.size();
-      q_feedback_image = feedback_image_buf_.size();
-    }
+    // The status timer owns buffer_mutex_ for this complete snapshot.
+    q_points = point_buf_.size();
+    q_pose = pose_buf_.size();
+    q_image = image_buf_.size();
+    q_depth = depth_buf_.size();
+    q_feedback_pose = feedback_pose_buf_.size();
+    q_feedback_image = feedback_image_buf_.size();
 
     gaussian_lic_msgs::msg::MappingStatus msg;
     msg.header.stamp = now();
-    msg.header.frame_id = "map";
+    msg.header.frame_id = world_frame_;
     msg.state = aligned_frame_count_ > 0 ?
       gaussian_lic_msgs::msg::MappingStatus::STATE_ACTIVE :
       gaussian_lic_msgs::msg::MappingStatus::STATE_INACTIVE;
@@ -2885,6 +3530,12 @@ private:
     msg.skipped_max_depth_points = dataset_.skipped_max_depth_count();
     msg.skipped_unprojected_points = dataset_.skipped_unprojected_count();
     msg.skipped_occluded_points = dataset_.skipped_occluded_count();
+    msg.depth_completion_inference_count = depth_completion_count_;
+    msg.depth_completion_accepted_count = depth_completion_accepted_count_;
+    msg.depth_completion_appended_points = depth_completion_appended_point_count_;
+    msg.depth_completion_rejected_bias_count = depth_completion_rejected_bias_count_;
+    msg.depth_completion_rejected_max_depth_points =
+      depth_completion_rejected_max_depth_point_count_;
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
     msg.gaussian_init_count = torch_gaussian_init_count_;
     msg.gaussian_extend_count = torch_gaussian_extend_count_;
@@ -2966,7 +3617,8 @@ private:
       "last_points=%zu pending_points=%zu map_points=%zu total_points=%zu | "
       "sync_anchor=%s | "
       "rate tracking=%.2fHz mapping=%.2fHz | "
-      "depth_completion=%lu depth_completion_errors=%lu | "
+      "depth_completion=%lu accepted=%lu appended=%lu rejected_bias=%lu rejected_max=%lu "
+      "last_diff=%.4fm last_appended=%zu depth_completion_errors=%lu | "
       "torch_cameras=%lu torch_errors=%lu torch_image=%s torch_depth=%s | "
       "torch_gaussians=%zu gaussian_inits=%lu gaussian_extends=%lu last_inserted=%zu "
       "gaussian_init_errors=%lu gaussian_extend_errors=%lu gaussian_xyz=%s gaussian_features=%s "
@@ -2986,7 +3638,11 @@ private:
       dataset_.total_point_count(),
       sync_anchor_stream_name_.c_str(),
       last_tracking_hz_, last_mapping_hz_,
-      depth_completion_count_, depth_completion_error_count_,
+      depth_completion_count_, depth_completion_accepted_count_,
+      depth_completion_appended_point_count_, depth_completion_rejected_bias_count_,
+      depth_completion_rejected_max_depth_point_count_,
+      last_depth_completion_mean_difference_m_, last_depth_completion_appended_point_count_,
+      depth_completion_error_count_,
       torch_camera_count_, torch_camera_error_count_, last_torch_image_dims_.c_str(),
       last_torch_depth_dims_.c_str(),
       torch_gaussian_count_, torch_gaussian_init_count_, torch_gaussian_extend_count_,
@@ -3003,7 +3659,8 @@ private:
       torch_gaussian_prune_count_, torch_gaussian_pruned_total_, last_torch_pruned_,
       torch_gaussian_prune_error_count_,
       last_mapping_latency_ms_, mean_iteration_ms_,
-      camera_info_count_, intrinsics.source.c_str(), intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
+      intrinsics.camera_info_count, intrinsics.source.c_str(), intrinsics.fx, intrinsics.fy,
+      intrinsics.cx, intrinsics.cy,
       dropped_pointcloud_count_, dropped_pose_count_, dropped_image_count_, dropped_depth_count_,
       dataset_.skipped_nonpositive_depth_count(), dataset_.skipped_max_depth_count(),
       dataset_.skipped_unprojected_count(), dataset_.skipped_occluded_count(),
@@ -3082,6 +3739,18 @@ private:
   bool publish_rendered_preview_{true};
   bool publish_rendered_feedback_before_update_{false};
   bool save_map_render_evaluation_{false};
+  std::string lpips_model_path_;
+  bool auto_finalize_on_inactivity_{false};
+  double auto_finalize_inactivity_sec_{5.0};
+  std::string auto_finalize_output_path_{"gaussian_lic_result"};
+  bool auto_finalize_include_skybox_{false};
+  bool auto_finalize_exit_{false};
+  bool auto_finalize_attempted_{false};
+  bool auto_finalize_completed_{false};
+  bool end_of_input_requested_{false};
+  int64_t end_of_input_requested_steady_ns_{0};
+  std::string end_of_input_service_{"/gaussian_lic/end_of_input"};
+  std::string terminal_failure_message_;
   std::string active_profile_{"default"};
   std::string render_mode_{"debug_cpu"};
   std::string rendered_image_mode_;
@@ -3117,14 +3786,20 @@ private:
   rclcpp::Publisher<gaussian_lic_msgs::msg::RenderedFeedback>::SharedPtr rendered_feedback_pub_;
   rclcpp::Publisher<gaussian_lic_msgs::msg::GaussianArray>::SharedPtr gaussian_map_pub_;
   rclcpp::Service<gaussian_lic_msgs::srv::SaveMap>::SharedPtr save_map_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr end_of_input_srv_;
   rclcpp::TimerBase::SharedPtr status_timer_;
   rclcpp::TimerBase::SharedPtr process_timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  rclcpp::CallbackGroup::SharedPtr mapping_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr status_callback_group_;
 
   MapperDataset dataset_;
   nav_msgs::msg::Path path_msg_;
 
   std::mutex buffer_mutex_;
+  // Protects Dataset/Torch map/path/render state shared by the mapping timer,
+  // status timer, and SaveMap service when using a multi-threaded executor.
+  std::mutex mapping_state_mutex_;
   std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> point_buf_;
   std::deque<geometry_msgs::msg::PoseStamped::ConstSharedPtr> pose_buf_;
   std::deque<sensor_msgs::msg::Image::ConstSharedPtr> image_buf_;
@@ -3135,6 +3810,8 @@ private:
   builtin_interfaces::msg::Time last_aligned_stamp_;
   builtin_interfaces::msg::Time last_imu_stamp_;
   std::chrono::steady_clock::time_point last_rate_sample_time_{std::chrono::steady_clock::now()};
+  std::atomic<int64_t> last_input_receive_steady_ns_{0};
+  std::atomic<int64_t> last_converted_frame_steady_ns_{0};
   uint64_t last_rate_aligned_count_{0};
   uint64_t last_rate_converted_count_{0};
   float last_tracking_hz_{0.0F};
@@ -3151,6 +3828,10 @@ private:
   uint64_t depth_count_{0};
   uint64_t imu_count_{0};
   uint64_t depth_completion_count_{0};
+  uint64_t depth_completion_accepted_count_{0};
+  uint64_t depth_completion_appended_point_count_{0};
+  uint64_t depth_completion_rejected_bias_count_{0};
+  uint64_t depth_completion_rejected_max_depth_point_count_{0};
   uint64_t depth_completion_error_count_{0};
   uint64_t aligned_frame_count_{0};
   uint64_t converted_frame_count_{0};
@@ -3209,7 +3890,8 @@ private:
   int last_image_height_{0};
   cv::Mat last_image_rgb_float_;
   cv::Mat last_depth_m_float_;
-  bool depth_completion_missing_engine_warned_{false};
+  double last_depth_completion_mean_difference_m_{0.0};
+  size_t last_depth_completion_appended_point_count_{0};
 #ifdef GAUSSIAN_LIC_ENABLE_TENSORRT
   std::unique_ptr<gaussian_lic_mapping::DepthCompleter> depth_completer_;
   int depth_completer_width_{0};
@@ -3217,6 +3899,7 @@ private:
 #endif
   Eigen::Quaterniond last_q_wc_{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d last_t_wc_{Eigen::Vector3d::Zero()};
+  gaussian_lic_mapping::CameraIntrinsics last_intrinsics_;
   size_t last_points_in_frame_{0};
   size_t torch_gaussian_count_{0};
   size_t last_torch_gaussian_inserted_{0};
@@ -3240,9 +3923,31 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<MappingNode>());
-  rclcpp::shutdown();
-  return 0;
+  try {
+    auto node = std::make_shared<MappingNode>();
+    rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions{}, 3U, false, std::chrono::milliseconds(100));
+    executor.add_node(node);
+    executor.spin();
+    executor.remove_node(node);
+    const bool terminal_failure = !node->terminal_failure_message().empty();
+    const std::string terminal_failure_message = node->terminal_failure_message();
+    node.reset();
+    if (rclcpp::ok()) {
+      rclcpp::shutdown();
+    }
+    if (terminal_failure) {
+      std::cerr << "mapping node terminal failure: " << terminal_failure_message << std::endl;
+      return 1;
+    }
+    return 0;
+  } catch (const std::exception & ex) {
+    RCLCPP_FATAL(
+      rclcpp::get_logger("gaussian_lic_mapping"),
+      "mapping node terminated after a required pipeline failure: %s", ex.what());
+    rclcpp::shutdown();
+    return 1;
+  }
 }
 #else
 RCLCPP_COMPONENTS_REGISTER_NODE(MappingNode)

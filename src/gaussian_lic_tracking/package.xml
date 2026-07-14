@@ -9,12 +9,14 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>builtin_interfaces</depend>
+  <depend>eigen</depend>
   <depend>eigen3_cmake_module</depend>
   <depend>gaussian_lic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rclcpp</depend>
   <depend>rosbag2_cpp</depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
   <depend>sensor_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>libceres-dev</depend>

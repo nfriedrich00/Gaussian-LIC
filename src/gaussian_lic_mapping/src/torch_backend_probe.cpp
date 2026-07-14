@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cmath>
 #include <iostream>
+#include <stdexcept>
 #include <utility>
 
 #include <opencv2/core.hpp>
@@ -37,15 +39,21 @@ int main()
   point.depth_m = 1.0F;
   frame_data.points.push_back(point);
   dataset.add_frame(std::move(frame_data));
-  auto gaussian_map = gaussian_lic_mapping::initialize_gaussian_map(
-    dataset, 3, 1.0, 1.0, 1.0, torch::kCPU);
-  const auto gaussian_count_after_init = gaussian_map.foreground_count + gaussian_map.skybox_count;
   gaussian_lic_mapping::GaussianBackendConfig optimization_config;
+  optimization_config.sh_degree = 3;
+  optimization_config.scaling_scale = 1.0;
   optimization_config.enable_photometric_optimization = true;
   optimization_config.optimization_steps_per_keyframe = 2;
   optimization_config.optimization_max_samples = 16;
   optimization_config.feature_lr = 0.01;
   optimization_config.opacity_lr = 0.0;
+  optimization_config.apply_exposure = true;
+  optimization_config.exposure_lr = 0.01;
+  auto gaussian_map = gaussian_lic_mapping::initialize_gaussian_map(
+    dataset, optimization_config, 1.0, 1.0, torch::kCPU);
+  const auto gaussian_count_after_init = gaussian_map.foreground_count + gaussian_map.skybox_count;
+  const auto initial_exposure = gaussian_map.exposure.detach().clone();
+  const float initial_foreground_log_scale = gaussian_map.scaling.index({0, 0}).item<float>();
   const auto optimization_result = gaussian_lic_mapping::optimize_gaussian_map_from_camera(
     gaussian_map, camera, optimization_config,
     optimization_config.optimization_steps_per_keyframe, torch::kCPU);
@@ -72,6 +80,16 @@ int main()
   prune_config.prune_min_opacity = 0.0;
   const auto prune_result = gaussian_lic_mapping::prune_gaussian_map(gaussian_map, prune_config);
 
+  if (gaussian_map.exposure.sizes() != torch::IntArrayRef({3, 4})) {
+    throw std::runtime_error("apply_exposure did not initialize a [3,4] affine transform");
+  }
+  if (gaussian_map.exposure_step != 2U || torch::allclose(initial_exposure, gaussian_map.exposure)) {
+    throw std::runtime_error("exposure_lr did not update the trained exposure transform");
+  }
+  if (std::abs(initial_foreground_log_scale) > 1.0e-6F) {
+    throw std::runtime_error("foreground scaling is not log(scaling_scale * depth / focal)");
+  }
+
   std::cout << "torch_version=" << TORCH_VERSION << "\n";
   std::cout << "cuda_available=" << (torch::cuda::is_available() ? "true" : "false") << "\n";
   std::cout << "image_sizes=" << camera.original_image.sizes() << "\n";
@@ -85,6 +103,8 @@ int main()
   std::cout << "optimization_steps=" << optimization_result.steps << "\n";
   std::cout << "optimization_supervised=" << optimization_result.supervised_count << "\n";
   std::cout << "optimization_l1=" << optimization_result.photometric_l1 << "\n";
+  std::cout << "exposure_step=" << gaussian_map.exposure_step << "\n";
+  std::cout << "foreground_log_scale=" << initial_foreground_log_scale << "\n";
   std::cout << "appended_count=" << appended_count << "\n";
   std::cout << "pruned_count=" << prune_result.removed_count << "\n";
   std::cout << "gaussian_count=" << gaussian_map.foreground_count + gaussian_map.skybox_count << "\n";

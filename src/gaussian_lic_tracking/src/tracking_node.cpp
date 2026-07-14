@@ -25,6 +25,7 @@
 #include <gaussian_lic_tracking/imu_propagator.hpp>
 #include <gaussian_lic_tracking/lidar_deskew.hpp>
 #include <gaussian_lic_tracking/lidar_factor.hpp>
+#include <gaussian_lic_tracking/pointcloud2_access.hpp>
 #include <gaussian_lic_tracking/sliding_window_optimizer.hpp>
 #include <gaussian_lic_tracking/spline/so3_ops.hpp>
 #include <gaussian_lic_tracking/time.hpp>
@@ -318,10 +319,8 @@ public:
     if (!output_tum_path_.empty()) {
       output_tum_stream_.open(output_tum_path_, std::ios::out | std::ios::trunc);
       if (!output_tum_stream_) {
-        RCLCPP_WARN(
-          get_logger(),
-          "could not open output_tum_path '%s' for writing",
-          output_tum_path_.c_str());
+        throw std::runtime_error(
+                "could not open output_tum_path '" + output_tum_path_ + "' for writing");
       } else {
         output_tum_stream_ << "# timestamp tx ty tz qx qy qz qw" << std::endl;
         output_tum_stream_.flush();
@@ -364,6 +363,9 @@ public:
       1);
     world_frame_ = declare_parameter<std::string>("world_frame", "map");
     child_frame_ = declare_parameter<std::string>("child_frame", "base_link");
+    if (world_frame_.empty() || child_frame_.empty()) {
+      throw std::runtime_error("world_frame and child_frame must not be empty");
+    }
     publish_tf_ = declare_parameter<bool>("publish_tf", false);
     max_path_length_ = integer_parameter_at_least(
       "max_path_length", declare_parameter<int>("max_path_length", 5000), 1);
@@ -1531,9 +1533,8 @@ private:
     const sensor_msgs::msg::PointField * y_field{nullptr};
     const sensor_msgs::msg::PointField * z_field{nullptr};
     const sensor_msgs::msg::PointField * time_field{nullptr};
-    int x_offset{-1};
-    int y_offset{-1};
-    int z_offset{-1};
+    gaussian_lic_tracking::pointcloud2::Layout layout;
+    bool valid{false};
     bool xyz_writable{false};
   };
 
@@ -4263,9 +4264,12 @@ private:
 
     sensor_msgs::msg::PointCloud2 output_cloud = msg;
     std::vector<Eigen::Vector3d> lidar_points;
+    PointCloudFields fields;
+    auto decoded_points = decode_pointcloud(msg, fields);
+    if (!fields.valid) {
+      return;
+    }
     if (enable_lio_factor_ || enable_lidar_deskew_) {
-      PointCloudFields fields;
-      auto decoded_points = decode_pointcloud(msg, fields);
       lidar_points.reserve(decoded_points.size());
       for (auto & point : decoded_points) {
         point.point_i = q_i_l_ * point.point_i + p_i_l_;
@@ -4276,7 +4280,16 @@ private:
         const auto deskew_result = deskew_decoded_points(decoded_points, tracking_pose);
         if (deskew_result.deskewed_count > 0U) {
           lidar_points = deskew_result.points_i;
-          write_deskewed_points(output_cloud, fields, decoded_points, deskew_result.points_i);
+          // The optimizer consumes IMU-frame points, but the republished cloud
+          // retains the input LiDAR frame_id. Convert the deskewed coordinates
+          // back to that LiDAR frame before writing them into PointCloud2.
+          std::vector<Eigen::Vector3d> deskewed_points_l;
+          deskewed_points_l.reserve(deskew_result.points_i.size());
+          const Eigen::Quaterniond q_l_i = q_i_l_.conjugate();
+          for (const auto & point_i : deskew_result.points_i) {
+            deskewed_points_l.push_back(q_l_i * (point_i - p_i_l_));
+          }
+          write_deskewed_points(output_cloud, fields, decoded_points, deskewed_points_l);
           RCLCPP_DEBUG_THROTTLE(
             get_logger(), *get_clock(), 2000,
             "deskewed %zu/%zu LiDAR points with max offset %.6fs",
@@ -7473,83 +7486,32 @@ private:
     return nullptr;
   }
 
-  static bool read_numeric_field(
-    const uint8_t * base,
-    const sensor_msgs::msg::PointField & field,
-    double & value)
+  static std::optional<int64_t> scaled_nanoseconds(
+    const double value, const double scale)
   {
-    switch (field.datatype) {
-      case sensor_msgs::msg::PointField::INT8: {
-          int8_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::UINT8: {
-          uint8_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::INT16: {
-          int16_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::UINT16: {
-          uint16_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::INT32: {
-          int32_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::UINT32: {
-          uint32_t raw = 0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::FLOAT32: {
-          float raw = 0.0F;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = static_cast<double>(raw);
-          return true;
-        }
-      case sensor_msgs::msg::PointField::FLOAT64: {
-          double raw = 0.0;
-          std::memcpy(&raw, base + field.offset, sizeof(raw));
-          value = raw;
-          return true;
-        }
-      default:
-        return false;
+    const long double scaled =
+      static_cast<long double>(value) * static_cast<long double>(scale);
+    if (!std::isfinite(scaled)) {
+      return std::nullopt;
     }
+    const long double rounded = std::round(scaled);
+    if (rounded < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
+      rounded > static_cast<long double>(std::numeric_limits<int64_t>::max()))
+    {
+      return std::nullopt;
+    }
+    return static_cast<int64_t>(rounded);
   }
 
-  static size_t point_field_scalar_size(const sensor_msgs::msg::PointField & field)
+  static std::optional<int64_t> add_nanoseconds(
+    const int64_t stamp_ns, const int64_t offset_ns)
   {
-    switch (field.datatype) {
-      case sensor_msgs::msg::PointField::INT8:
-      case sensor_msgs::msg::PointField::UINT8:
-        return 1U;
-      case sensor_msgs::msg::PointField::INT16:
-      case sensor_msgs::msg::PointField::UINT16:
-        return 2U;
-      case sensor_msgs::msg::PointField::INT32:
-      case sensor_msgs::msg::PointField::UINT32:
-      case sensor_msgs::msg::PointField::FLOAT32:
-        return 4U;
-      case sensor_msgs::msg::PointField::FLOAT64:
-        return 8U;
-      default:
-        return 0U;
+    if ((offset_ns > 0 && stamp_ns > std::numeric_limits<int64_t>::max() - offset_ns) ||
+      (offset_ns < 0 && stamp_ns < std::numeric_limits<int64_t>::min() - offset_ns))
+    {
+      return std::nullopt;
     }
+    return stamp_ns + offset_ns;
   }
 
   std::optional<int64_t> decode_point_stamp_ns(
@@ -7560,35 +7522,36 @@ private:
     if (!std::isfinite(raw_time)) {
       return std::nullopt;
     }
-    auto scale_to_ns = [](const double value, const double scale) {
-        return static_cast<int64_t>(std::llround(value * scale));
-      };
-    int64_t time_ns = 0;
+    std::optional<int64_t> time_ns;
     bool offset_mode = true;
     if (lidar_time_unit_ == "seconds") {
-      time_ns = scale_to_ns(raw_time, 1.0e9);
+      time_ns = scaled_nanoseconds(raw_time, 1.0e9);
     } else if (lidar_time_unit_ == "milliseconds") {
-      time_ns = scale_to_ns(raw_time, 1.0e6);
+      time_ns = scaled_nanoseconds(raw_time, 1.0e6);
     } else if (lidar_time_unit_ == "microseconds") {
-      time_ns = scale_to_ns(raw_time, 1.0e3);
+      time_ns = scaled_nanoseconds(raw_time, 1.0e3);
     } else if (lidar_time_unit_ == "nanoseconds") {
-      time_ns = static_cast<int64_t>(std::llround(raw_time));
+      time_ns = scaled_nanoseconds(raw_time, 1.0);
     } else {
       const double abs_time = std::abs(raw_time);
       if (field_name == "offset_time") {
-        time_ns = static_cast<int64_t>(std::llround(raw_time));
+        time_ns = scaled_nanoseconds(raw_time, 1.0);
       } else if (abs_time > 1.0e17) {
-        time_ns = static_cast<int64_t>(std::llround(raw_time));
+        time_ns = scaled_nanoseconds(raw_time, 1.0);
         offset_mode = false;
       } else if (abs_time > 1.0e14) {
-        time_ns = scale_to_ns(raw_time, 1.0e3);
+        time_ns = scaled_nanoseconds(raw_time, 1.0e3);
         offset_mode = false;
       } else if ((field_name == "timestamp" || field_name == "t") && abs_time > 1.0e8) {
-        time_ns = scale_to_ns(raw_time, 1.0e9);
+        time_ns = scaled_nanoseconds(raw_time, 1.0e9);
         offset_mode = false;
       } else {
-        time_ns = scale_to_ns(raw_time, 1.0e9);
+        time_ns = scaled_nanoseconds(raw_time, 1.0e9);
       }
+    }
+
+    if (!time_ns.has_value()) {
+      return std::nullopt;
     }
 
     if (lidar_time_mode_ == "absolute") {
@@ -7596,7 +7559,7 @@ private:
     } else if (lidar_time_mode_ == "offset") {
       offset_mode = true;
     }
-    return offset_mode ? cloud_stamp_ns + time_ns : time_ns;
+    return offset_mode ? add_nanoseconds(cloud_stamp_ns, time_ns.value()) : time_ns;
   }
 
   std::vector<DecodedLidarPoint> decode_pointcloud(
@@ -7604,25 +7567,28 @@ private:
     PointCloudFields & fields)
   {
     std::vector<DecodedLidarPoint> points;
-    if (msg.is_bigendian) {
+    fields = PointCloudFields{};
+    std::string layout_error;
+    if (!gaussian_lic_tracking::pointcloud2::validate_layout(
+        msg, fields.layout, &layout_error))
+    {
       ++lidar_invalid_frames_;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "big-endian PointCloud2 is not supported by the native tracking LiDAR factor");
+        "invalid PointCloud2 layout: %s", layout_error.c_str());
       return points;
     }
-
-    fields = PointCloudFields{};
+    if (fields.layout.point_count == 0U) {
+      fields.valid = true;
+      return points;
+    }
     for (const auto & field : msg.fields) {
       if (field.name == "x") {
         fields.x_field = &field;
-        fields.x_offset = static_cast<int>(field.offset);
       } else if (field.name == "y") {
         fields.y_field = &field;
-        fields.y_offset = static_cast<int>(field.offset);
       } else if (field.name == "z") {
         fields.z_field = &field;
-        fields.z_offset = static_cast<int>(field.offset);
       }
     }
     fields.time_field = find_time_field(msg);
@@ -7630,35 +7596,34 @@ private:
       fields.x_field != nullptr && fields.y_field != nullptr && fields.z_field != nullptr &&
       fields.x_field->datatype == sensor_msgs::msg::PointField::FLOAT32 &&
       fields.y_field->datatype == sensor_msgs::msg::PointField::FLOAT32 &&
-      fields.z_field->datatype == sensor_msgs::msg::PointField::FLOAT32;
-    if (fields.x_offset < 0 || fields.y_offset < 0 || fields.z_offset < 0) {
+      fields.z_field->datatype == sensor_msgs::msg::PointField::FLOAT32 &&
+      fields.x_field->count == 1U && fields.y_field->count == 1U &&
+      fields.z_field->count == 1U;
+    if (fields.x_field == nullptr || fields.y_field == nullptr || fields.z_field == nullptr) {
       ++lidar_invalid_frames_;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "PointCloud2 must expose numeric x/y/z fields for the native tracking LiDAR factor");
       return points;
     }
-
-    uint32_t max_offset = 0U;
+    std::string field_error;
     for (const auto * field : {fields.x_field, fields.y_field, fields.z_field, fields.time_field}) {
       if (field == nullptr) {
         continue;
       }
-      const size_t scalar_size = point_field_scalar_size(*field);
-      if (scalar_size == 0U) {
-        continue;
+      if (!gaussian_lic_tracking::pointcloud2::validate_scalar_field(
+          *field, fields.layout, &field_error))
+      {
+        ++lidar_invalid_frames_;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "invalid PointCloud2 field '%s': %s", field->name.c_str(), field_error.c_str());
+        return points;
       }
-      max_offset = std::max(max_offset, field->offset + static_cast<uint32_t>(scalar_size));
     }
-    if (msg.point_step < max_offset || msg.point_step == 0U) {
-      ++lidar_invalid_frames_;
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "PointCloud2 point_step is too small for x/y/z fields");
-      return points;
-    }
+    fields.valid = true;
 
-    const size_t count = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
+    const size_t count = fields.layout.point_count;
     points.reserve(count);
     const int64_t cloud_stamp_ns = gaussian_lic_tracking::stamp_to_nanoseconds(msg.header.stamp);
     size_t invalid_points = 0U;
@@ -7666,17 +7631,15 @@ private:
     size_t out_of_range_point_times = 0U;
     double max_abs_point_time_offset_s = 0.0;
     for (size_t index = 0; index < count; ++index) {
-      const size_t base = index * static_cast<size_t>(msg.point_step);
-      if (base + max_offset > msg.data.size()) {
-        break;
-      }
       double x = 0.0;
       double y = 0.0;
       double z = 0.0;
-      const uint8_t * point_base = msg.data.data() + base;
-      if (!read_numeric_field(point_base, *fields.x_field, x) ||
-        !read_numeric_field(point_base, *fields.y_field, y) ||
-        !read_numeric_field(point_base, *fields.z_field, z))
+      if (!gaussian_lic_tracking::pointcloud2::read_numeric(
+          msg, fields.layout, index, *fields.x_field, x) ||
+        !gaussian_lic_tracking::pointcloud2::read_numeric(
+          msg, fields.layout, index, *fields.y_field, y) ||
+        !gaussian_lic_tracking::pointcloud2::read_numeric(
+          msg, fields.layout, index, *fields.z_field, z))
       {
         ++invalid_points;
         continue;
@@ -7687,7 +7650,9 @@ private:
         point.index = index;
         if (fields.time_field != nullptr) {
           double raw_time = 0.0;
-          if (read_numeric_field(point_base, *fields.time_field, raw_time)) {
+          if (gaussian_lic_tracking::pointcloud2::read_numeric(
+              msg, fields.layout, index, *fields.time_field, raw_time))
+          {
             const auto stamp_ns = decode_point_stamp_ns(raw_time, fields.time_field->name, cloud_stamp_ns);
             if (stamp_ns.has_value()) {
               const double abs_offset_s =
@@ -7787,18 +7752,15 @@ private:
       return;
     }
     for (size_t i = 0; i < decoded_points.size(); ++i) {
-      const size_t base = decoded_points[i].index * static_cast<size_t>(msg.point_step);
-      if (base + static_cast<size_t>(std::max({fields.x_offset, fields.y_offset, fields.z_offset})) + sizeof(float) >
-        msg.data.size())
-      {
-        continue;
-      }
       const float x = static_cast<float>(deskewed_points[i].x());
       const float y = static_cast<float>(deskewed_points[i].y());
       const float z = static_cast<float>(deskewed_points[i].z());
-      std::memcpy(msg.data.data() + base + static_cast<size_t>(fields.x_offset), &x, sizeof(float));
-      std::memcpy(msg.data.data() + base + static_cast<size_t>(fields.y_offset), &y, sizeof(float));
-      std::memcpy(msg.data.data() + base + static_cast<size_t>(fields.z_offset), &z, sizeof(float));
+      gaussian_lic_tracking::pointcloud2::write_float32(
+        msg, fields.layout, decoded_points[i].index, *fields.x_field, x);
+      gaussian_lic_tracking::pointcloud2::write_float32(
+        msg, fields.layout, decoded_points[i].index, *fields.y_field, y);
+      gaussian_lic_tracking::pointcloud2::write_float32(
+        msg, fields.layout, decoded_points[i].index, *fields.z_field, z);
     }
   }
 
@@ -9429,13 +9391,26 @@ private:
 
 int main(int argc, char ** argv)
 {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<TrackingNode>();
-  if (!node->deterministic_bag_path().empty()) {
-    node->run_deterministic_replay();
-  } else {
-    rclcpp::spin(node);
+  int exit_code = 0;
+  bool initialized = false;
+  try {
+    rclcpp::init(argc, argv);
+    initialized = true;
+    auto node = std::make_shared<TrackingNode>();
+    if (!node->deterministic_bag_path().empty()) {
+      node->run_deterministic_replay();
+    } else {
+      rclcpp::spin(node);
+    }
+  } catch (const std::exception & error) {
+    std::fprintf(stderr, "tracking_node: %s\n", error.what());
+    exit_code = 1;
+  } catch (...) {
+    std::fprintf(stderr, "tracking_node: unknown fatal error\n");
+    exit_code = 1;
   }
-  rclcpp::shutdown();
-  return 0;
+  if (initialized && rclcpp::ok()) {
+    rclcpp::shutdown();
+  }
+  return exit_code;
 }

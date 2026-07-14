@@ -47,6 +47,8 @@ Dr. Fu Zhang < fuzhang@hku.hk >.
 */
 #include "image_frame.hpp"
 
+#include <stdexcept>
+
 Image_frame::Image_frame()
 {
     m_gama_para( 0 ) = 1.0;
@@ -113,7 +115,7 @@ void Image_frame::init_cubic_interpolation()
     m_img_rows = m_img.rows;
     m_img_cols = m_img.cols;
 #if (CV_MAJOR_VERSION >= 4)
-    cv::cvtColor(m_img, m_img_gray, cv::COLOR_RGB2GRAY);
+    cv::cvtColor(m_img, m_img_gray, cv::COLOR_BGR2GRAY);
 #else
     // cv::cvtColor(m_img, m_img_gray, CV_RGB2GRAY);
      cv::cvtColor(m_img, m_img_gray, CV_BGR2GRAY);
@@ -135,15 +137,11 @@ bool Image_frame::project_3d_to_2d(const pcl::PointXYZI & in_pt, Eigen::Matrix3d
     if (!m_if_have_set_pose)
     {
         cout << ANSI_COLOR_RED_BOLD << "You have not set the camera pose yet!" << ANSI_COLOR_RESET << endl;
-        // refresh_pose_for_projection();
-        while (1)
-        {};
+        return false;
     }
     if (m_if_have_set_intrinsic == 0)
     {
         cout << "You have not set the intrinsic yet!!!" << endl;
-        while (1)
-        {} ;
         return false;
     }
 
@@ -193,7 +191,7 @@ inline T getSubPixel(cv::Mat & mat, const double & row, const  double & col, dou
         floor_row -= pos_bias;
         floor_col -= pos_bias;
         ceil_row += pos_bias;
-        ceil_row += pos_bias;
+        ceil_col += pos_bias;
     }
     return ((1.0 - frac_row) * (1.0 - frac_col) * (T)mat.ptr<T>(floor_row)[floor_col]) +
                (frac_row * (1.0 - frac_col) * (T)mat.ptr<T>(ceil_row)[floor_col]) +
@@ -240,17 +238,12 @@ double Image_frame::get_grey_color( double &u, double &v, int layer )
 
     if ( layer == 0 )
     {
-        double gray_val = getSubPixel< uchar >( m_img, v, u );
+        double gray_val = getSubPixel< uchar >( m_img_gray, v, u );
         return gray_val;
     }
     else
     {
-        // TODO
-        while ( 1 )
-        {
-            cout << "To be process here" << __LINE__ << endl;
-            std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
-        };
+        throw std::invalid_argument("Image_frame::get_grey_color supports only layer 0");
     }
 
     return m_gama_para( 0 ) * val + m_gama_para( 1 );

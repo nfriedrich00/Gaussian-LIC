@@ -125,8 +125,8 @@ Configs: `run_lio/config/ct_odometry_lico_full_baseline.yaml`,
 `run_lio/config/ct_odometry_lico_degraded_coupled.yaml`, and
 `run_lio/config/cbd_mapper_coupled.yaml`. Mapper binary `build/gaussian_lic_mapping/mapping_node`
 (CUDA with a locally configured libtorch path, for example through `Torch_DIR` or
-`LD_LIBRARY_PATH`). Note: track A exits with code 134
-(pre-existing LICO teardown `terminate`) AFTER saving the trajectory — this is benign.
+`LD_LIBRARY_PATH`). Track A must now exit cleanly: the former code-134 LICO teardown
+failure has been fixed, and the reproduction scripts treat every abnormal exit as an error.
 The PSNR ablation configs are `run_lio/config/cbd_mapper.yaml` (100 steps),
 `run_lio/config/cbd_mapper_coupled.yaml` / `cbd_mapper_moreopt.yaml` (200 steps),
 `run_lio/config/cbd_mapper_opt300.yaml` (300 steps), and

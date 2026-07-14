@@ -49,6 +49,7 @@ Dr. Fu Zhang < fuzhang@hku.hk >.
 #define __LOGGER_HPP__
 #include "os_compatible.hpp"
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -155,6 +156,20 @@ namespace Common_tools // Commond tools
 {
 using namespace std;
 
+inline string default_file_logger_directory()
+{
+    try
+    {
+        const auto path = std::filesystem::temp_directory_path() / "cocolic";
+        std::filesystem::create_directories(path);
+        return path.string();
+    }
+    catch (...)
+    {
+        return ".";
+    }
+}
+
 inline void printf_software_version()
 {
 
@@ -237,9 +252,10 @@ class File_logger
     {
         for ( auto it = m_map_file_os.begin(); it != m_map_file_os.end(); it++ )
         {
-            it->second->flush();
-            ( it->second ) = NULL;
-            delete it->second;
+            std::ostream *stream = it->second;
+            if ( stream != nullptr ) stream->flush();
+            if ( stream != nullptr && stream != &std::cout ) delete stream;
+            it->second = nullptr;
         }
         m_map_file_os.clear();
     };
@@ -254,7 +270,7 @@ class File_logger
         // mkdir(m_save_dir_name.c_str(), 0775);
     }
 
-    File_logger( string _dir_name = string( "/home/ziv/data/" ) )
+    File_logger( string _dir_name = default_file_logger_directory() )
     {
         m_mutex_log = std::make_shared< std::mutex >();
         set_log_dir( _dir_name );
@@ -706,9 +722,10 @@ class File_logger
     {
         for ( auto it = m_map_file_os.begin(); it != m_map_file_os.end(); it++ )
         {
-            it->second->flush();
-            ( it->second ) = NULL;
-            delete it->second;
+            std::ostream *stream = it->second;
+            if ( stream != nullptr ) stream->flush();
+            if ( stream != nullptr && stream != &std::cout ) delete stream;
+            it->second = nullptr;
         }
         m_map_file_os.clear();
     };
@@ -723,7 +740,7 @@ class File_logger
         // mkdir(m_save_dir_name.c_str(), 0775);
     }
 
-    File_logger( string _dir_name = string( "/home/ziv/data/" ) )
+    File_logger( string _dir_name = default_file_logger_directory() )
     {
         m_mutex_log = std::make_shared< std::mutex >();
         set_log_dir( _dir_name );

@@ -1,6 +1,6 @@
 # SPNet TensorRT Runtime Status
 
-Status date: 2026-05-05
+Status date: 2026-07-14
 
 ## Local Result
 
@@ -10,8 +10,10 @@ RTX 5070 Ti Laptop GPU (`sm_120`) path:
 ```text
 TensorRT SDK: /home/frank/Software/TensorRT-10.9.0.34-cuda12.8
 Checkpoint:   external/Gaussian-LIC/ckpt/Large_300.pth
-ONNX:         /home/frank/Software/TensorRT-engines/spnet_512_640.onnx
-Engine:       /home/frank/Software/TensorRT-engines/spnet_512_640_fp16.engine
+512 ONNX:     /home/frank/Software/TensorRT-engines/spnet_512_640.onnx
+512 engine:   /home/frank/Software/TensorRT-engines/spnet_512_640_fp16.engine
+480 ONNX:     /home/frank/Software/TensorRT-engines/spnet_480_640.onnx
+480 engine:   /home/frank/Software/TensorRT-engines/spnet_480_640_fp16.engine
 ```
 
 Artifact hashes:
@@ -22,11 +24,18 @@ Large_300.pth:
 spnet_512_640.onnx:
   d977ba4ddf843d224778170d43453d4be4c532a72945a4949b97d1874654c24d
 spnet_512_640_fp16.engine:
-  67b0f9f8360dd771b4451ef2a06d17b57a238c808396719a5a725c6b64433158
+  514b5e4bde4e39f3290af0f68ed3f4ed72bb1553e50f3a46819e3a0f9ec2804a
+spnet_480_640.onnx:
+  0d1ed2c97d7049af8d2712ab058dd0c8696c59c84bcb1362c512f899ee05c3ad
+spnet_480_640_fp16.engine:
+  d8ff46cf67912cf18913e07993bc65ff499a71508d3c9e7a993d376a210b3f4b
 ```
 
-The engine is intentionally not checked into git. It is a 460 MB
-hardware/runtime-specific TensorRT plan.
+The engines are intentionally not checked into git. They are approximately
+479 MB hardware/runtime-specific TensorRT plans. The previous 512 plan is
+preserved as
+`spnet_512_640_fp16.engine.67b0f9f8360dd771.bak`; the active plans were rebuilt
+on this GPU and no longer emit TensorRT's cross-device-model warning.
 
 ## Benchmark
 
@@ -34,9 +43,17 @@ Command:
 
 ```bash
 ./scripts/install_local_tensorrt_10_9.sh
-SPNET_PYTHON=/home/frank/.cache/gaussian_lic_ros2/quality-venv/bin/python \
+SPNET_PYTHON=/home/frank/miniconda3/envs/active-gs-original/bin/python \
 TENSORRT_ROOT=/home/frank/Software/TensorRT-10.9.0.34-cuda12.8 \
   scripts/build_spnet_engine.sh \
+  --download \
+  --output-dir /home/frank/Software/TensorRT-engines
+
+# Build the 480x640 profile used by m2dgr/mcd.
+SPNET_PYTHON=/home/frank/miniconda3/envs/active-gs-original/bin/python \
+TENSORRT_ROOT=/home/frank/Software/TensorRT-10.9.0.34-cuda12.8 \
+  scripts/build_spnet_engine.sh \
+  --height 480 \
   --output-dir /home/frank/Software/TensorRT-engines
 ```
 
@@ -45,15 +62,18 @@ Observed `trtexec` summary:
 ```text
 TensorRT version: 10.9.0
 Compute Capability: 12.0
-Engine generation completed in 121.335 seconds.
-Created engine with size: 459.087 MiB
-Throughput: 38.4531 qps
-Latency mean: 26.4492 ms
-GPU compute mean: 25.8102 ms
+512x640 engine size: 478,634,188 bytes
+512x640 throughput: 36.8397 qps
+512x640 GPU compute mean/median/p95: 26.927/24.8081/37.1979 ms
+
+480x640 engine size: 480,817,404 bytes
+480x640 throughput: 38.4239 qps
+480x640 GPU compute mean: 25.8273 ms
 ```
 
-This satisfies the depth-completion runtime target of <= 30 ms/frame on the
-tested machine.
+Both profiles pass the native `depth_completer_probe` at their declared shape.
+Their mean GPU compute time satisfies the depth-completion runtime target of
+<= 30 ms/frame on the tested machine.
 
 ## Compatibility Note
 

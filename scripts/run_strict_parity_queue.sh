@@ -560,6 +560,8 @@ run_target() {
         quality_python="${HOME}/.cache/gaussian_lic_ros2/quality-cuda-venv/bin/python"
       elif [[ -x "${HOME}/.cache/gaussian_lic_ros2/quality-venv/bin/python" ]]; then
         quality_python="${HOME}/.cache/gaussian_lic_ros2/quality-venv/bin/python"
+      elif [[ -x "${HOME}/miniconda3/envs/active-gs-original/bin/python" ]]; then
+        quality_python="${HOME}/miniconda3/envs/active-gs-original/bin/python"
       else
         quality_python="/usr/bin/python3"
       fi

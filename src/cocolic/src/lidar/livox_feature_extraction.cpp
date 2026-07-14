@@ -17,15 +17,17 @@
  */
 
 #include "livox_feature_extraction.h"
-// ROS2 port: dropped <cocolic/feature_cloud.h> (debug-viz msg) +
-// <pcl_conversions/...> (only used by the now-stubbed PublishCloud).
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <algorithm>
 
 using namespace std;
 
 namespace cocolic
 {
 
-  LivoxFeatureExtraction::LivoxFeatureExtraction(const YAML::Node &node)
+  LivoxFeatureExtraction::LivoxFeatureExtraction(
+      const YAML::Node &node, const rclcpp::Node::SharedPtr &ros_node)
       : vx(0), vy(0), vz(0)
   {
     auto const &livox_node = node["Livox"];
@@ -49,8 +51,45 @@ namespace cocolic
     smallp_intersect = cos(smallp_intersect / 180 * M_PI);
     smallp_ratio = livox_node["smallp_ratio"].as<double>();
     point_filter_num = livox_node["point_filter_num"].as<int>();
+    if (n_scan <= 0 || point_filter_num <= 0 || group_size < 2)
+      throw std::invalid_argument(
+          "Livox n_scan/point_filter_num must be positive and group_size must be >= 2");
+    if (!std::isfinite(blind) || !std::isfinite(inf_bound) ||
+        !std::isfinite(disA) || !std::isfinite(disB) ||
+        !std::isfinite(limit_maxmid) || !std::isfinite(limit_midmin) ||
+        !std::isfinite(limit_maxmin) || !std::isfinite(p2l_ratio) ||
+        !std::isfinite(jump_up_limit) || !std::isfinite(jump_down_limit) ||
+        !std::isfinite(edgea) || !std::isfinite(edgeb) ||
+        !std::isfinite(smallp_intersect) || !std::isfinite(smallp_ratio) ||
+        blind < 0.0 || inf_bound < 0.0 || disA < 0.0 || disB < 0.0 ||
+        limit_maxmid <= 0.0 || limit_midmin <= 0.0 || limit_maxmin <= 0.0 ||
+        p2l_ratio <= 0.0 || edgea < 0.0 || edgeb < 0.0 || smallp_ratio <= 0.0)
+      throw std::invalid_argument("Livox feature parameters are outside their valid ranges");
 
-    // ROS2 port: dropped debug-viz publisher advertises (NodeHandle removed).
+    ros_node_ = ros_node;
+    if (ros_node_)
+    {
+      if (ros_node_->has_parameter("lidar_frame"))
+        debug_frame_ = ros_node_->get_parameter("lidar_frame").as_string();
+      const std::string prefix = ros_node_->has_parameter("topic_prefix")
+                                     ? ros_node_->get_parameter("topic_prefix").as_string()
+                                     : std::string();
+      const auto topic = [&prefix](const std::string &suffix) {
+        if (prefix.empty()) return "/" + suffix;
+        std::string normalized = prefix;
+        if (normalized.front() != '/') normalized.insert(normalized.begin(), '/');
+        if (normalized.back() != '/') normalized.push_back('/');
+        return normalized + suffix;
+      };
+      pub_corner_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("corner_cloud"), rclcpp::SensorDataQoS());
+      pub_surface_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("surface_cloud"), rclcpp::SensorDataQoS());
+      pub_full_cloud_ = ros_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+          topic("full_cloud"), rclcpp::SensorDataQoS());
+      pub_feature_cloud_ = ros_node_->create_publisher<cocolic::msg::FeatureCloud>(
+          topic("feature_cloud"), rclcpp::SensorDataQoS());
+    }
 
     AllocateMemory();
     // clearState();
@@ -61,12 +100,19 @@ namespace cocolic
       const CustomMsgLite::ConstPtr &lidar_msg,
       RTPointCloud::Ptr out_cloud)
   {
+    if (!lidar_msg || !out_cloud || lidar_msg->point_num == 0 ||
+        lidar_msg->point_num != lidar_msg->points.size())
+      return false;
+    out_cloud->clear();
     clearState();
 
     uint plsize = lidar_msg->point_num;
     p_corner_cloud->reserve(plsize);
     p_surface_cloud->reserve(plsize);
     p_full_cloud->resize(plsize);
+    RTPoint invalid_point{};
+    invalid_point.time = -1;
+    std::fill(p_full_cloud->points.begin(), p_full_cloud->points.end(), invalid_point);
 
     std::vector<RTPointCloud::Ptr> in_cloud_vec;
     in_cloud_vec.resize(n_scan);
@@ -76,7 +122,9 @@ namespace cocolic
       in_cloud_vec[i]->reserve(plsize);
     }
 
-    for (uint i = 1; i < plsize; i++)
+    bool have_previous = false;
+    RTPoint previous{};
+    for (uint i = 0; i < plsize; i++)
     {
       if ((lidar_msg->points[i].line < n_scan) &&
           ((lidar_msg->points[i].tag & 0x30) == 0x10) &&
@@ -84,27 +132,24 @@ namespace cocolic
           (!IS_VALID(lidar_msg->points[i].y)) &&
           (!IS_VALID(lidar_msg->points[i].z)))
       {
-        (*p_full_cloud)[i].x = lidar_msg->points[i].x;
-        (*p_full_cloud)[i].y = lidar_msg->points[i].y;
-        (*p_full_cloud)[i].z = lidar_msg->points[i].z;
-        (*p_full_cloud)[i].intensity = lidar_msg->points[i].reflectivity;
-        // (*p_full_cloud)[i].time = lidar_msg->points[i].offset_time * 1e-9;
-        (*p_full_cloud)[i].time = int64_t(lidar_msg->points[i].offset_time);
+        RTPoint point{};
+        point.x = lidar_msg->points[i].x;
+        point.y = lidar_msg->points[i].y;
+        point.z = lidar_msg->points[i].z;
+        point.intensity = lidar_msg->points[i].reflectivity;
+        point.ring = lidar_msg->points[i].line;
+        point.time = int64_t(lidar_msg->points[i].offset_time);
+        (*p_full_cloud)[i] = point;
 
-        if ((std::abs((*p_full_cloud)[i].x - (*p_full_cloud)[i - 1].x) > 1e-7) ||
-            (std::abs((*p_full_cloud)[i].y - (*p_full_cloud)[i - 1].y) > 1e-7) ||
-            (std::abs((*p_full_cloud)[i].z - (*p_full_cloud)[i - 1].z) > 1e-7))
+        if (!have_previous || std::abs(point.x - previous.x) > 1e-7 ||
+            std::abs(point.y - previous.y) > 1e-7 ||
+            std::abs(point.z - previous.z) > 1e-7)
         {
-          in_cloud_vec[lidar_msg->points[i].line]->push_back((*p_full_cloud)[i]);
+          in_cloud_vec[lidar_msg->points[i].line]->push_back(point);
         }
+        previous = point;
+        have_previous = true;
       }
-    }
-
-    if (in_cloud_vec[0]->size() <= 7)
-    {
-      // LOG(WARNING) << "[ParsePointCloud] input cloud size too small "
-      //              << in_cloud_vec[0]->size();
-      return false;
     }
 
     std::vector<std::vector<orgtype>> typess(n_scan);
@@ -113,6 +158,8 @@ namespace cocolic
       RTPointCloud &pl = (*in_cloud_vec[j]);
       vector<orgtype> &types = typess[j];
       plsize = pl.size();
+      if (plsize < 7)
+        continue;
       types.resize(plsize);
       plsize--;
       for (uint i = 0; i < plsize; i++)
@@ -127,6 +174,7 @@ namespace cocolic
       // plsize++;
       types[plsize].range =
           sqrt(pl[plsize].x * pl[plsize].x + pl[plsize].y * pl[plsize].y);
+      types[plsize].dista = plsize > 0 ? types[plsize - 1].dista : 0.0;
 
       giveFeature(pl, types, *p_corner_cloud, *p_surface_cloud);
     }
@@ -136,7 +184,9 @@ namespace cocolic
       *out_cloud += (*v);
     }
 
-    PublishCloud("map");
+    if (out_cloud->empty())
+      return false;
+    PublishCloud(lidar_msg->timebase);
     return true;
   }
 
@@ -144,6 +194,10 @@ namespace cocolic
       const CustomMsgLite::ConstPtr &lidar_msg,
       RTPointCloud::Ptr out_cloud)
   {
+    if (!lidar_msg || !out_cloud || lidar_msg->point_num == 0 ||
+        lidar_msg->point_num != lidar_msg->points.size())
+      return false;
+    out_cloud->clear();
     clearState();
 
     std::vector<RTPointCloud::Ptr> in_cloud_vec;
@@ -155,6 +209,9 @@ namespace cocolic
     p_corner_cloud->reserve(plsize);
     p_surface_cloud->reserve(plsize);
     p_full_cloud->resize(plsize);
+    RTPoint invalid_point{};
+    invalid_point.time = -1;
+    std::fill(p_full_cloud->points.begin(), p_full_cloud->points.end(), invalid_point);
 
     for (int i = 0; i < n_scan; i++)
     {
@@ -162,7 +219,9 @@ namespace cocolic
       in_cloud_vec[i]->reserve(plsize);
     }
     // ANCHOR - remove nearing pts.
-    for (uint i = 1; i < plsize; i++)
+    bool have_previous = false;
+    RTPoint previous{};
+    for (uint i = 0; i < plsize; i++)
     {
       if ((lidar_msg->points[i].line < n_scan) && (!IS_VALID(lidar_msg->points[i].x)) && (!IS_VALID(lidar_msg->points[i].y)) && (!IS_VALID(lidar_msg->points[i].z)) && lidar_msg->points[i].x > 0.7)
       {
@@ -174,24 +233,33 @@ namespace cocolic
           continue;
         }
         // clang-format on
-        (*p_full_cloud)[i].x = lidar_msg->points[i].x;
-        (*p_full_cloud)[i].y = lidar_msg->points[i].y;
-        (*p_full_cloud)[i].z = lidar_msg->points[i].z;
-        (*p_full_cloud)[i].intensity = lidar_msg->points[i].reflectivity;
-        (*p_full_cloud)[i].time = int64_t(lidar_msg->points[i].offset_time);
+        RTPoint point{};
+        point.x = lidar_msg->points[i].x;
+        point.y = lidar_msg->points[i].y;
+        point.z = lidar_msg->points[i].z;
+        point.intensity = lidar_msg->points[i].reflectivity;
+        point.ring = lidar_msg->points[i].line;
+        point.time = int64_t(lidar_msg->points[i].offset_time);
+        (*p_full_cloud)[i] = point;
 
-        if ((std::abs((*p_full_cloud)[i].x - (*p_full_cloud)[i - 1].x) > 1e-7) || (std::abs((*p_full_cloud)[i].y - (*p_full_cloud)[i - 1].y) > 1e-7) ||
-            (std::abs((*p_full_cloud)[i].z - (*p_full_cloud)[i - 1].z) > 1e-7))
+        if (!have_previous || std::abs(point.x - previous.x) > 1e-7 ||
+            std::abs(point.y - previous.y) > 1e-7 ||
+            std::abs(point.z - previous.z) > 1e-7)
         {
-          in_cloud_vec[lidar_msg->points[i].line]->push_back((*p_full_cloud)[i]);
+          in_cloud_vec[lidar_msg->points[i].line]->push_back(point);
         }
+        previous = point;
+        have_previous = true;
       }
     }
     if (in_cloud_vec.size() != n_scan)
     {
       return false;
     }
-    if (in_cloud_vec[0]->size() <= 7)
+    const bool has_usable_scan = std::any_of(
+        in_cloud_vec.begin(), in_cloud_vec.end(),
+        [](const RTPointCloud::Ptr &cloud) { return cloud && cloud->size() > 7; });
+    if (!has_usable_scan)
     {
       // LOG(WARNING) << "[ParsePointCloud] input cloud size too small "
       //              << in_cloud_vec[0]->size();
@@ -215,20 +283,24 @@ namespace cocolic
         vx = pl[i].x - pl[i + 1].x;
         vy = pl[i].y - pl[i + 1].y;
         vz = pl[i].z - pl[i + 1].z;
+        types[i].dista = vx * vx + vy * vy + vz * vz;
       }
       // plsize++;
       types[plsize].range = pl[plsize].x * pl[plsize].x + pl[plsize].y * pl[plsize].y;
+      types[plsize].dista = plsize > 0 ? types[plsize - 1].dista : 0.0;
       giveFeatureR3LIVE(pl, types, *p_corner_cloud, *p_surface_cloud);
     }
 
     ///
-    p_corner_cloud->push_back((*p_full_cloud)[0]);
     for (auto const &v : in_cloud_vec)
     {
       *out_cloud += (*v);
     }
 
-    // PublishCloud("map");
+    if (out_cloud->empty()) return false;
+    p_corner_cloud->push_back(out_cloud->front());
+
+    PublishCloud(lidar_msg->timebase);
     return true;
   }
 
@@ -236,40 +308,59 @@ namespace cocolic
       const CustomMsgLite::ConstPtr &lidar_msg,
       RTPointCloud::Ptr out_cloud)
   {
+    if (!lidar_msg || !out_cloud || lidar_msg->point_num == 0 ||
+        lidar_msg->point_num != lidar_msg->points.size())
+      return false;
+    out_cloud->clear();
     clearState();
 
     uint plsize = lidar_msg->point_num;
     p_corner_cloud->reserve(plsize);
     p_surface_cloud->reserve(plsize);
     p_full_cloud->resize(plsize);
+    RTPoint invalid_point{};
+    invalid_point.time = -1;
+    std::fill(p_full_cloud->points.begin(), p_full_cloud->points.end(), invalid_point);
 
     uint valid_num = 0;
-    for (uint i = 1; i < plsize; i++)
+    bool have_previous = false;
+    RTPoint previous{};
+    for (uint i = 0; i < plsize; i++)
     {
       if ((lidar_msg->points[i].line < n_scan) && ((lidar_msg->points[i].tag & 0x30) == 0x10 || (lidar_msg->points[i].tag & 0x30) == 0x00))
       {
         valid_num++;
         if (valid_num % point_filter_num == 0)
         {
-          (*p_full_cloud)[i].x = lidar_msg->points[i].x;
-          (*p_full_cloud)[i].y = lidar_msg->points[i].y;
-          (*p_full_cloud)[i].z = lidar_msg->points[i].z;
-          (*p_full_cloud)[i].intensity = lidar_msg->points[i].reflectivity;
-          (*p_full_cloud)[i].time = int64_t(lidar_msg->points[i].offset_time);
+          RTPoint point{};
+          point.x = lidar_msg->points[i].x;
+          point.y = lidar_msg->points[i].y;
+          point.z = lidar_msg->points[i].z;
+          point.intensity = lidar_msg->points[i].reflectivity;
+          point.ring = lidar_msg->points[i].line;
+          point.time = int64_t(lidar_msg->points[i].offset_time);
+          (*p_full_cloud)[i] = point;
 
-          if (((abs((*p_full_cloud)[i].x - (*p_full_cloud)[i - 1].x) > 1e-7) || (abs((*p_full_cloud)[i].y - (*p_full_cloud)[i - 1].y) > 1e-7) || (abs((*p_full_cloud)[i].z - (*p_full_cloud)[i - 1].z) > 1e-7)) && ((*p_full_cloud)[i].x * (*p_full_cloud)[i].x + (*p_full_cloud)[i].y * (*p_full_cloud)[i].y + (*p_full_cloud)[i].z * (*p_full_cloud)[i].z > (blind * blind)))
+          const bool distinct = !have_previous ||
+              abs(point.x - previous.x) > 1e-7 ||
+              abs(point.y - previous.y) > 1e-7 ||
+              abs(point.z - previous.z) > 1e-7;
+          if (distinct && point.x * point.x + point.y * point.y + point.z * point.z >
+              (blind * blind))
           {
-            p_surface_cloud->push_back((*p_full_cloud)[i]);
+            p_surface_cloud->push_back(point);
           }
+          previous = point;
+          have_previous = true;
         }
       }
     }
 
-    p_corner_cloud->push_back((*p_full_cloud)[0]);
-
+    if (p_surface_cloud->empty())
+      return false;
+    p_corner_cloud->push_back(p_surface_cloud->front());
     *out_cloud = *p_full_cloud;
-
-    PublishCloud("map");
+    PublishCloud(lidar_msg->timebase);
     return true;
   }
 
@@ -387,10 +478,12 @@ void LivoxFeatureExtraction::LivoxHandler(
     }
     uint head = 0;
 
-    while (types[head].range < blind)
+    while (head < plsize && types[head].range < blind)
     {
       head++;
     }
+    if (head == plsize)
+      return;
 
     // Surf
     plsize2 = (plsize > group_size) ? (plsize - group_size) : 0;
@@ -456,7 +549,7 @@ void LivoxFeatureExtraction::LivoxHandler(
       {
         if (last_state == 1)
         {
-          uint i_nex_tem;
+          uint i_nex_tem = last_i_nex;
           uint j;
           for (j = last_i + 1; j <= last_i_nex; j++)
           {
@@ -517,7 +610,9 @@ void LivoxFeatureExtraction::LivoxHandler(
       }
 
       Eigen::Vector3d vec_a(pl[i].x, pl[i].y, pl[i].z);
-      Eigen::Vector3d vecs[2];
+      Eigen::Vector3d vecs[2] = {
+          Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
+      bool valid_vec[2] = {false, false};
 
       for (int j = 0; j < 2; j++)
       {
@@ -542,8 +637,16 @@ void LivoxFeatureExtraction::LivoxHandler(
 
         vecs[j] = Eigen::Vector3d(pl[i + m].x, pl[i + m].y, pl[i + m].z);
         vecs[j] = vecs[j] - vec_a;
+        valid_vec[j] = true;
 
-        types[i].angle[j] = vec_a.dot(vecs[j]) / vec_a.norm() / vecs[j].norm();
+        const double angle_denominator = vec_a.norm() * vecs[j].norm();
+        if (angle_denominator <= 1e-12)
+        {
+          types[i].angle[j] = 1.0;
+          types[i].edj[j] = Nr_zero;
+          continue;
+        }
+        types[i].angle[j] = vec_a.dot(vecs[j]) / angle_denominator;
         if (types[i].angle[j] < jump_up_limit)
         {
           types[i].edj[j] = Nr_180;
@@ -554,8 +657,11 @@ void LivoxFeatureExtraction::LivoxHandler(
         }
       }
 
-      types[i].intersect =
-          vecs[Prev].dot(vecs[Next]) / vecs[Prev].norm() / vecs[Next].norm();
+      const double intersect_denominator = vecs[Prev].norm() * vecs[Next].norm();
+      types[i].intersect = valid_vec[Prev] && valid_vec[Next] &&
+              intersect_denominator > 1e-12
+          ? vecs[Prev].dot(vecs[Next]) / intersect_denominator
+          : 2.0;
       if (types[i].edj[Prev] == Nr_nor && types[i].edj[Next] == Nr_zero &&
           types[i].dista > 0.0225 && types[i].dista > 4 * types[i - 1].dista)
       {
@@ -655,11 +761,13 @@ void LivoxFeatureExtraction::LivoxHandler(
 
         if (j == uint(last_surface + point_filter_num - 1))
         {
-          RTPoint ap;
+          RTPoint ap{};
 
           ap.x = pl[j].x;
           ap.y = pl[j].y;
           ap.z = pl[j].z;
+          ap.intensity = pl[j].intensity;
+          ap.ring = pl[j].ring;
           ap.time = pl[j].time;
           pl_surf.push_back(ap);
 
@@ -674,18 +782,20 @@ void LivoxFeatureExtraction::LivoxHandler(
         }
         if (last_surface != -1)
         {
-          RTPoint ap;
+          RTPoint ap{};
           for (uint k = last_surface; k < j; k++)
           {
             ap.x += pl[k].x;
             ap.y += pl[k].y;
             ap.z += pl[k].z;
-            // ap.time += pl[k].time;
+            ap.intensity += pl[k].intensity;
             ap.time = pl[k].time;
           }
           ap.x /= (j - last_surface);
           ap.y /= (j - last_surface);
           ap.z /= (j - last_surface);
+          ap.intensity /= (j - last_surface);
+          ap.ring = pl[last_surface].ring;
           pl_surf.push_back(ap);
         }
         last_surface = -1;
@@ -706,10 +816,12 @@ void LivoxFeatureExtraction::LivoxHandler(
       return;
     }
     uint head = 0;
-    while (types[head].range < blind)
+    while (head < plsize && types[head].range < blind)
     {
       head++;
     }
+    if (head == plsize)
+      return;
 
     // Surf
     plsize2 = (plsize > group_size) ? (plsize - group_size) : 0;
@@ -723,7 +835,7 @@ void LivoxFeatureExtraction::LivoxHandler(
     int last_state = 0;
     int plane_type;
 
-    RTPoint ap;
+    RTPoint ap{};
     int g_LiDAR_sampling_point_step = 1;
     for (uint i = head; i < plsize2; i += g_LiDAR_sampling_point_step)
     {
@@ -734,6 +846,7 @@ void LivoxFeatureExtraction::LivoxHandler(
         ap.z = pl[i].z;
         ap.time = pl[i].time;
         ap.intensity = pl[i].intensity;
+        ap.ring = pl[i].ring;
         pl_surf.push_back(ap);
       }
     }
@@ -807,7 +920,8 @@ void LivoxFeatureExtraction::LivoxHandler(
       }
     }
 
-    if ((two_dis * two_dis / leng_wid) < p2l_ratio)
+    if (leng_wid <= 1e-16 || two_dis <= 1e-16 ||
+        (two_dis * two_dis / leng_wid) < p2l_ratio)
     {
       curr_direct.setZero();
       return 0;
@@ -899,28 +1013,40 @@ void LivoxFeatureExtraction::LivoxHandler(
     return true;
   }
 
-  void LivoxFeatureExtraction::PublishCloud(std::string frame_id)
+  void LivoxFeatureExtraction::PublishCloud(int64_t stamp_ns)
   {
-    // ROS2 port: debug-viz publish is a no-op for offline replay.
-    (void)frame_id;
-    return;
-#if 0
-    sensor_msgs::PointCloud2 corner_msg;
-    sensor_msgs::PointCloud2 surface_msg;
+    if (!ros_node_) return;
+    const auto stamp = stamp_ns >= 0 ? rclcpp::Time(stamp_ns) : ros_node_->now();
+    sensor_msgs::msg::PointCloud2 corner_msg;
+    sensor_msgs::msg::PointCloud2 surface_msg;
+    sensor_msgs::msg::PointCloud2 full_msg;
 
     pcl::toROSMsg(*p_corner_cloud, corner_msg);
     pcl::toROSMsg(*p_surface_cloud, surface_msg);
+    pcl::toROSMsg(*p_full_cloud, full_msg);
 
-    corner_msg.header.stamp = ros::Time::now();
-    corner_msg.header.frame_id = frame_id;
-    surface_msg.header.stamp = ros::Time::now();
-    surface_msg.header.frame_id = frame_id;
+    corner_msg.header.stamp = stamp;
+    corner_msg.header.frame_id = debug_frame_;
+    surface_msg.header.stamp = stamp;
+    surface_msg.header.frame_id = debug_frame_;
+    full_msg.header.stamp = stamp;
+    full_msg.header.frame_id = debug_frame_;
 
-    if (pub_corner_cloud.getNumSubscribers() != 0)
-      pub_corner_cloud.publish(corner_msg);
-    if (pub_surface_cloud.getNumSubscribers() != 0)
-      pub_surface_cloud.publish(surface_msg);
-#endif
+    if (pub_corner_cloud_->get_subscription_count() != 0)
+      pub_corner_cloud_->publish(corner_msg);
+    if (pub_surface_cloud_->get_subscription_count() != 0)
+      pub_surface_cloud_->publish(surface_msg);
+    if (pub_full_cloud_->get_subscription_count() != 0)
+      pub_full_cloud_->publish(full_msg);
+    if (pub_feature_cloud_->get_subscription_count() != 0)
+    {
+      cocolic::msg::FeatureCloud feature;
+      feature.header = corner_msg.header;
+      feature.corner_cloud = corner_msg;
+      feature.surface_cloud = surface_msg;
+      feature.full_cloud = full_msg;
+      pub_feature_cloud_->publish(feature);
+    }
   }
 
 } // namespace cocolic

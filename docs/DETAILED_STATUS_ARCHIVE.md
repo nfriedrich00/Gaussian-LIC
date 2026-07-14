@@ -688,7 +688,7 @@ Rebuild the local engine with:
 
 ```bash
 ./scripts/install_local_tensorrt_10_9.sh
-SPNET_PYTHON=/home/frank/.cache/gaussian_lic_ros2/quality-cuda-venv/bin/python \
+SPNET_PYTHON=/home/frank/miniconda3/envs/active-gs-original/bin/python \
 TENSORRT_ROOT=/home/frank/Software/TensorRT-10.9.0.34-cuda12.8 \
   ./scripts/build_spnet_engine.sh --output-dir /home/frank/Software/TensorRT-engines
 ```
@@ -970,8 +970,8 @@ maps.
 Strict quality extraction defaults LPIPS to `cuda` on the target workstation; set
 `--quality-lpips-device cpu` or `QUALITY_LPIPS_DEVICE=cpu` only for CPU-only
 report refreshes. On this workstation the CUDA report environment is
-`${HOME}/.cache/gaussian_lic_ros2/quality-cuda-venv/bin/python` with
-Torch `2.7.0+cu128`; if a requested CUDA LPIPS device is unavailable, the
+`${HOME}/miniconda3/envs/active-gs-original/bin/python` with
+Torch `2.9.1+cu130`; if a requested CUDA LPIPS device is unavailable, the
 evaluator records the requested device and falls back to CPU instead of leaving
 LPIPS null.
 

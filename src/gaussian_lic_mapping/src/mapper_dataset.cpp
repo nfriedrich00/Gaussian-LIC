@@ -24,6 +24,7 @@ const CameraFrameRecord & MapperDataset::add_frame(
   record.image_name = make_image_name(frame.is_keyframe, frame.frame_index);
   record.width = frame.width;
   record.height = frame.height;
+  record.intrinsics = frame.intrinsics;
   record.image_rgb_float = std::move(frame.image_rgb_float);
   record.depth_m_float = std::move(frame.depth_m_float);
   record.r_wc = frame.r_wc;

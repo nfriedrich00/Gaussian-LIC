@@ -68,6 +68,7 @@ struct MapperFrameData
   bool is_keyframe{false};
   int width{0};
   int height{0};
+  CameraIntrinsics intrinsics;
   cv::Mat image_rgb_float;
   cv::Mat depth_m_float;
   Eigen::Quaterniond q_wc{Eigen::Quaterniond::Identity()};
@@ -79,6 +80,29 @@ struct MapperFrameData
   size_t skipped_points_unprojected{0};
   size_t skipped_points_occluded{0};
 };
+
+// Result of the ROS1 Dataset::addFrame SPNet post-processing stage.  The
+// completed image is deliberately not stored in MapperFrameData: Gaussian-LIC
+// trains against the original sparse depth and uses completion only to seed
+// additional Gaussians in empty image patches.
+struct DepthCompletionResult
+{
+  bool attempted{false};
+  bool accepted{false};
+  double mean_known_depth_difference_m{0.0};
+  size_t selected_patch_count{0};
+  size_t appended_point_count{0};
+  size_t rejected_max_depth_count{0};
+};
+
+DepthCompletionResult append_depth_completion_points(
+  MapperFrameData & frame,
+  const cv::Mat & completed_depth_m,
+  const CameraIntrinsics & intrinsics,
+  int patch_size,
+  double max_depth_m,
+  double known_depth_mean_tolerance_m = 0.1,
+  double sobel_edge_threshold = 0.1);
 
 MapperFrameData convert_aligned_frame(
   const AlignedRosFrame & frame,

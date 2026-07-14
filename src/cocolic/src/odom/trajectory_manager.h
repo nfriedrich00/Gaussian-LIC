@@ -206,7 +206,7 @@ namespace cocolic
 
     void SetIntrinsic(const Eigen::Matrix3d& K) { K_ = K; }
 
-    // GL2 step-2c: per-frame render-photometric reference (patches sampled from the
+    // Render-photometric: per-frame render-photometric reference (patches sampled from the
     // mapper's rendered image at each pnp pixel) + observed grayscale image. When set,
     // UpdateTrajectoryWithLIC adds photometric factors alongside the PnP factors.
     void SetRenderPhotometric(const cv::Mat &observed_gray,
@@ -223,7 +223,7 @@ namespace cocolic
     }
     void ClearRenderPhotometric() { rp_enable_ = false; rp_observed_gray_.release(); rp_patches_.clear(); rp_valid_.clear(); }
 
-    // GL2 demo: time-windowed LiDAR degradation (good -> bad -> good). During [start,end)
+    // Diagnostic: time-windowed LiDAR degradation (good -> bad -> good). During [start,end)
     // of the trajectory the LiDAR factor weight is scaled by factor (<1 weakens LIO),
     // so the map built in the good segments must carry the degraded segment (breaks
     // the self-referential ceiling and shows a larger render-photometric coupling gain.
@@ -320,13 +320,15 @@ namespace cocolic
 
     Eigen::Matrix3d K_;
 
-    // GL2 step-2c render-photometric reference (set per-frame by OdometryManager)
+    // Render-photometric render-photometric reference (set per-frame by OdometryManager)
     cv::Mat rp_observed_gray_;
     std::vector<std::vector<float>> rp_patches_;
     std::vector<char> rp_valid_;
     int rp_patch_half_ = 2;
     double rp_weight_ = 1.0;
     bool rp_enable_ = false;
+    int init_solve_count_ = 0;
+    int loam_solve_count_ = 0;
 
   public:
     void ClearVisual()

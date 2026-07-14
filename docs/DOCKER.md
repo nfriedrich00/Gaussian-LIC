@@ -50,13 +50,13 @@ docker run --rm -it \
   --gpus all \
   -v "$PWD":/ws \
   gaussian_lic_ros2:jazzy \
-  bash -lc "./scripts/build_ros2.sh && ./scripts/smoke_test.sh --tf"
+  bash -lc "./scripts/build_ros2.sh --cpu-only && ./scripts/smoke_test.sh --tf"
 ```
 
 This runs:
 
 ```bash
-./scripts/build_ros2.sh
+./scripts/build_ros2.sh --cpu-only
 ./scripts/smoke_test.sh --tf
 ```
 

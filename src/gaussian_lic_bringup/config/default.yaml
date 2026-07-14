@@ -163,7 +163,7 @@ mapping_node:
     torch_gaussian_optimization_max_samples: 4096
     torch_gaussian_optimization_sampling: upstream_random
     torch_gaussian_optimization_seed: 20260505
-    enable_torch_gaussian_pruning: true
+    enable_torch_gaussian_pruning: false
     torch_gaussian_prune_min_opacity: 0.005
     torch_gaussian_max_foreground: 1500000
     torch_gaussian_prune_count_policy: uniform
@@ -198,7 +198,7 @@ mapping_node:
     max_map_points: 200000
     publish_rendered_preview: true
     publish_rendered_feedback_before_update: false
-    render_mode: rasterizer
+    render_mode: debug_cpu
     active_profile: default
     odometry_topic: /gaussian_lic/odometry
     path_topic: /gaussian_lic/path

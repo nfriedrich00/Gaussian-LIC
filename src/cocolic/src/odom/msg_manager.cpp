@@ -18,14 +18,44 @@
 
 #include <odom/msg_manager.h>
 #include <utils/parameter_struct.h>
+#include <utils/config_path.h>
 
 #include <pcl/common/transforms.h>
-#include <cstring>  // ROS2 port: std::memcpy for PointCloud2 field reads
+#include <cstring>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
 
 namespace cocolic
 {
 
-  MsgManager::MsgManager(const YAML::Node &node, const std::string &config_path)
+  namespace
+  {
+    bool HostIsBigEndian()
+    {
+      const uint16_t value = 0x0102;
+      return *reinterpret_cast<const uint8_t *>(&value) == 0x01;
+    }
+
+    template <typename T>
+    T ReadPointField(const uint8_t *data, bool source_big_endian)
+    {
+      static_assert(std::is_trivially_copyable<T>::value, "scalar field required");
+      std::array<uint8_t, sizeof(T)> bytes{};
+      std::memcpy(bytes.data(), data, sizeof(T));
+      if (source_big_endian != HostIsBigEndian())
+        std::reverse(bytes.begin(), bytes.end());
+      T value{};
+      std::memcpy(&value, bytes.data(), sizeof(T));
+      return value;
+    }
+  } // namespace
+
+  MsgManager::MsgManager(const YAML::Node &node, const std::string &config_path,
+                         const rclcpp::Node::SharedPtr &ros_node)
       : has_valid_msg_(true),
         t_offset_imu_(0),
         t_offset_camera_(0),
@@ -35,7 +65,8 @@ namespace cocolic
         lidar_timestamp_end_(false),
         remove_wrong_time_imu_(false),
         if_normalized_(false),
-        image_topic_("")
+        image_topic_(""),
+        ros_node_(ros_node)
   {
     OdometryMode odom_mode = OdometryMode(node["odometry_mode"].as<int>());
 
@@ -44,7 +75,7 @@ namespace cocolic
 
     /// imu topic
     std::string imu_yaml = node["imu_yaml"].as<std::string>();
-    YAML::Node imu_node = YAML::LoadFile(config_path + imu_yaml);
+    YAML::Node imu_node = YAML::LoadFile(ResolveConfigPath(config_path, imu_yaml));
     imu_topic_ = imu_node["imu_topic"].as<std::string>();
     // pose_topic_ = imu_node["pose_topic"].as<std::string>();
     // remove_wrong_time_imu_ = imu_node["remove_wrong_time_imu"].as<bool>();
@@ -54,7 +85,7 @@ namespace cocolic
     // double imu_period_s = 1. / imu_frequency;
 
     std::string cam_yaml = node["camera_yaml"].as<std::string>();
-    YAML::Node cam_node = YAML::LoadFile(config_path + cam_yaml);
+    YAML::Node cam_node = YAML::LoadFile(ResolveConfigPath(config_path, cam_yaml));
     img_time_offset_ = cam_node["img_time_offset"].as<double>();
 
     // add_extra_timeoffset_s_ =
@@ -67,18 +98,38 @@ namespace cocolic
       use_image_ = true;
     if (use_image_)
     {
-      std::string cam_yaml = config_path + node["camera_yaml"].as<std::string>();
+      std::string cam_yaml =
+          ResolveConfigPath(config_path, node["camera_yaml"].as<std::string>());
       YAML::Node cam_node = YAML::LoadFile(cam_yaml);
       image_topic_ = cam_node["image_topic"].as<std::string>();
       image_topic_compressed_ = std::string(image_topic_).append("/compressed");
-      // ROS2 port: dropped debug image publisher (/vio/test_img).
+      if (ros_node_)
+      {
+        const std::string configured = ros_node_->has_parameter(
+                                           "debug_input_image_topic")
+                                           ? ros_node_->get_parameter(
+                                                 "debug_input_image_topic")
+                                                 .as_string()
+                                           : ros_node_->declare_parameter<std::string>(
+                                                 "debug_input_image_topic",
+                                                 "vio/test_img");
+        const std::string prefix = ros_node_->has_parameter("topic_prefix")
+                                       ? ros_node_->get_parameter("topic_prefix")
+                                             .as_string()
+                                       : std::string();
+        debug_input_image_topic_ = ResolveTopic(prefix, configured);
+        debug_input_image_pub_ =
+            ros_node_->create_publisher<sensor_msgs::msg::Image>(
+                debug_input_image_topic_, rclcpp::SensorDataQoS());
+      }
     }
     image_max_timestamp_ = -1;
 
     /// lidar topic
     std::string lidar_yaml = node["lidar_yaml"].as<std::string>();
-    YAML::Node lidar_node = YAML::LoadFile(config_path + lidar_yaml);
-    num_lidars_ = lidar_node["num_lidars"].as<int>();
+    YAML::Node lidar_node = YAML::LoadFile(ResolveConfigPath(config_path, lidar_yaml));
+    num_lidars_ =
+        yaml::RequirePositive<int>(lidar_node, "num_lidars", "lidar");
     lidar_timestamp_end_ = lidar_node["lidar_timestamp_end"].as<bool>();
 
     bool use_livox = false;
@@ -122,12 +173,68 @@ namespace cocolic
 
     if (use_livox)
       livox_feature_extraction_ =
-          std::make_shared<LivoxFeatureExtraction>(lidar_node);
+          std::make_shared<LivoxFeatureExtraction>(lidar_node, ros_node);
     if (use_vlp)
       velodyne_feature_extraction_ =
-          std::make_shared<VelodyneFeatureExtraction>(lidar_node);
+          std::make_shared<VelodyneFeatureExtraction>(lidar_node, ros_node);
 
     LoadBag(node);
+  }
+
+  std::string MsgManager::ResolveTopic(const std::string &topic_prefix,
+                                       const std::string &configured_topic)
+  {
+    if (configured_topic.empty())
+      throw std::invalid_argument("configured ROS topic must not be empty");
+    if (configured_topic.front() == '/')
+      return configured_topic;
+
+    std::string topic = configured_topic;
+    while (!topic.empty() && topic.front() == '/') topic.erase(topic.begin());
+    std::string prefix = topic_prefix;
+    while (!prefix.empty() && prefix.front() == '/') prefix.erase(prefix.begin());
+    while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+    return prefix.empty() ? "/" + topic : "/" + prefix + "/" + topic;
+  }
+
+  bool MsgManager::IMUMsgToIMUData(
+      const sensor_msgs::msg::Imu::ConstSharedPtr &imu_msg, IMUData &data,
+      bool normalized_accel, bool *orientation_valid, std::string *error)
+  {
+    const auto fail = [&](const std::string &reason) {
+      if (orientation_valid) *orientation_valid = false;
+      if (error) *error = reason;
+      return false;
+    };
+    if (!imu_msg) return fail("null sensor_msgs/Imu pointer");
+    if (imu_msg->header.stamp.nanosec >= 1000000000U)
+      return fail("header.stamp.nanosec is outside [0, 1e9)");
+
+    const Eigen::Vector3d gyro(imu_msg->angular_velocity.x,
+                               imu_msg->angular_velocity.y,
+                               imu_msg->angular_velocity.z);
+    Eigen::Vector3d accel(imu_msg->linear_acceleration.x,
+                          imu_msg->linear_acceleration.y,
+                          imu_msg->linear_acceleration.z);
+    if (!gyro.allFinite() || !accel.allFinite())
+      return fail("angular_velocity or linear_acceleration is non-finite");
+    if (normalized_accel) accel *= 9.81;
+
+    data.timestamp = int64_t(imu_msg->header.stamp.sec) * 1000000000LL +
+                     int64_t(imu_msg->header.stamp.nanosec);
+    data.gyro = gyro;
+    data.accel = accel;
+    data.orientation = SO3d(Eigen::Quaterniond::Identity());
+
+    Eigen::Quaterniond q(imu_msg->orientation.w, imu_msg->orientation.x,
+                         imu_msg->orientation.y, imu_msg->orientation.z);
+    const double q_norm = q.norm();
+    const bool q_valid = q.coeffs().allFinite() && std::isfinite(q_norm) &&
+                         q_norm > 0.0 && std::fabs(q_norm - 1.0) < 0.01;
+    if (q_valid) data.orientation = SO3d(q.normalized());
+    if (orientation_valid) *orientation_valid = q_valid;
+    if (error) error->clear();
+    return true;
   }
 
   void MsgManager::LoadBag(const YAML::Node &node)
@@ -158,13 +265,20 @@ namespace cocolic
     reader_ = std::make_shared<rosbag2_cpp::Reader>();
     reader_->open(storage_options);
 
+    const auto metadata = reader_->get_metadata();
+    bag_first_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        metadata.starting_time.time_since_epoch())
+                        .count();
+    for (const auto &topic : reader_->get_all_topics_and_types())
+      topic_types_[topic.name] = topic.type;
+
     // Topic filter (equivalent to rosbag::TopicQuery).
     rosbag2_storage::StorageFilter filter;
     filter.topics = topics;
     reader_->set_filter(filter);
 
-    // Play window relative to bag begin; absolute begin captured lazily from the
-    // first message's recv_timestamp in SpinBagOnce (avoids metadata epoch issues).
+    // Play window is relative to the complete bag's metadata start, before the
+    // topic filter. This matches ROS1 rosbag::View begin-time semantics.
     bag_start_s_ = bag_start;
     bag_durr_s_ = bag_durr;
 
@@ -179,6 +293,10 @@ namespace cocolic
     static rclcpp::Serialization<sensor_msgs::msg::Imu> imu_ser;
     static rclcpp::Serialization<sensor_msgs::msg::PointCloud2> pc_ser;
     static rclcpp::Serialization<sensor_msgs::msg::Image> img_ser;
+    static rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_img_ser;
+#ifdef COCOLIC_HAS_LIVOX_ROS_DRIVER2
+    static rclcpp::Serialization<livox_ros_driver2::msg::CustomMsg> livox_ser;
+#endif
 
     while (true)
     {
@@ -189,7 +307,6 @@ namespace cocolic
       }
       auto bag_msg = reader_->read_next();
       const int64_t t_ns = bag_msg->recv_timestamp;
-      if (bag_first_ns_ < 0) bag_first_ns_ = t_ns;
       const double rel_s = (t_ns - bag_first_ns_) * 1e-9;
       if (rel_s < bag_start_s_) continue;  // before window
       if (bag_durr_s_ >= 0 && rel_s > bag_start_s_ + bag_durr_s_)
@@ -214,9 +331,36 @@ namespace cocolic
         auto idx = std::distance(lidar_topics_.begin(), it);
         if (lidar_types[idx] == LIVOX)  //[solid-state lidar: Livox]
         {
-          sensor_msgs::msg::PointCloud2 pc;
-          pc_ser.deserialize_message(&ser, &pc);
-          CustomMsgLite::ConstPtr lidar_msg = PointCloud2ToCustomMsg(pc);
+          const auto type_it = topic_types_.find(msg_topic);
+          const std::string type =
+              type_it == topic_types_.end() ? std::string() : type_it->second;
+          CustomMsgLite::ConstPtr lidar_msg;
+          if (type == "sensor_msgs/msg/PointCloud2")
+          {
+            sensor_msgs::msg::PointCloud2 pc;
+            pc_ser.deserialize_message(&ser, &pc);
+            lidar_msg = PointCloud2ToCustomMsg(pc);
+          }
+#ifdef COCOLIC_HAS_LIVOX_ROS_DRIVER2
+          else if (type == "livox_ros_driver2/msg/CustomMsg")
+          {
+            livox_ros_driver2::msg::CustomMsg custom;
+            livox_ser.deserialize_message(&ser, &custom);
+            lidar_msg = LivoxCustomMsgToLite(custom);
+          }
+#else
+          else if (type == "livox_ros_driver2/msg/CustomMsg")
+          {
+            throw std::runtime_error(
+                "Livox topic uses livox_ros_driver2/msg/CustomMsg, but cocolic "
+                "was built without livox_ros_driver2. Install the driver and rebuild.");
+          }
+#endif
+          else
+          {
+            throw std::runtime_error("Unsupported Livox topic type '" + type +
+                                     "' on " + msg_topic);
+          }
           CheckLidarMsgTimestamp(t_ns * NS_TO_S, lidar_msg->timebase * NS_TO_S);
           LivoxMsgHandle(lidar_msg, idx);
         }
@@ -230,11 +374,17 @@ namespace cocolic
         }
         return;
       }
-      if (use_image_ &&
-          (msg_topic == image_topic_ || msg_topic == image_topic_compressed_))  // camera
+      if (use_image_ && msg_topic == image_topic_)
       {
         auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
         img_ser.deserialize_message(&ser, image_msg.get());
+        ImageMsgHandle(image_msg);
+        return;
+      }
+      if (use_image_ && msg_topic == image_topic_compressed_)
+      {
+        auto image_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
+        compressed_img_ser.deserialize_message(&ser, image_msg.get());
         ImageMsgHandle(image_msg);
         return;
       }
@@ -242,49 +392,139 @@ namespace cocolic
     }
   }
 
-  // ROS2 port: build the upstream CustomMsg surface from the offset_time_full
-  // PointCloud2 (20-byte stride). Field offsets resolved by name; per-point time
-  // (offset_time, ns) carried through as CustomPointLite::offset_time so the
-  // feature extraction's continuous-time deskew stays bit-faithful.
   CustomMsgLite::Ptr MsgManager::PointCloud2ToCustomMsg(
       const sensor_msgs::msg::PointCloud2 &pc)
   {
+    using PF = sensor_msgs::msg::PointField;
+    if (pc.point_step == 0)
+      throw std::invalid_argument("Livox PointCloud2 point_step must be non-zero");
+    if (pc.width > 0 && pc.height == 0)
+      throw std::invalid_argument("Livox PointCloud2 with non-zero width must have non-zero height");
+    if (pc.height != 0 && pc.width > std::numeric_limits<size_t>::max() / pc.height)
+      throw std::invalid_argument("Livox PointCloud2 dimensions overflow size_t");
+    const size_t n = size_t(pc.width) * size_t(pc.height);
+    if (n > std::numeric_limits<uint32_t>::max())
+      throw std::invalid_argument("Livox PointCloud2 contains more than UINT32_MAX points");
+    const size_t min_row_step = size_t(pc.point_step) * size_t(pc.width);
+    if (pc.row_step < min_row_step)
+      throw std::invalid_argument("Livox PointCloud2 row_step is smaller than width*point_step");
+    if (pc.height != 0 && size_t(pc.row_step) >
+                              std::numeric_limits<size_t>::max() / size_t(pc.height))
+      throw std::invalid_argument("Livox PointCloud2 row_step*height overflows size_t");
+    if (size_t(pc.row_step) * size_t(pc.height) > pc.data.size())
+      throw std::invalid_argument("Livox PointCloud2 data is shorter than row_step*height");
+
+    const auto find_field = [&](const std::string &name,
+                                uint8_t datatype,
+                                bool required) -> const PF * {
+      auto it = std::find_if(pc.fields.begin(), pc.fields.end(),
+                             [&](const PF &field) { return field.name == name; });
+      if (it == pc.fields.end())
+      {
+        if (required)
+          throw std::invalid_argument("Livox PointCloud2 is missing required field '" +
+                                      name + "'");
+        return nullptr;
+      }
+      if (it->count != 1 || it->datatype != datatype)
+        throw std::invalid_argument("Livox PointCloud2 field '" + name +
+                                    "' has an unexpected datatype/count");
+      size_t field_size = datatype == PF::UINT8 ? 1U : 4U;
+      if (size_t(it->offset) + field_size > pc.point_step)
+        throw std::invalid_argument("Livox PointCloud2 field '" + name +
+                                    "' exceeds point_step");
+      return &*it;
+    };
+
+    const PF *fx = find_field("x", PF::FLOAT32, true);
+    const PF *fy = find_field("y", PF::FLOAT32, true);
+    const PF *fz = find_field("z", PF::FLOAT32, true);
+    const PF *fot = find_field("offset_time", PF::UINT32, true);
+    const PF *ftag = find_field("tag", PF::UINT8, true);
+    const PF *fline = find_field("line", PF::UINT8, true);
+    const PF *fint = nullptr;
+    auto intensity_it = std::find_if(pc.fields.begin(), pc.fields.end(),
+                                     [](const PF &f) { return f.name == "intensity"; });
+    if (intensity_it != pc.fields.end())
+    {
+      if (intensity_it->count != 1 ||
+          (intensity_it->datatype != PF::UINT8 && intensity_it->datatype != PF::FLOAT32))
+        throw std::invalid_argument(
+            "Livox PointCloud2 intensity must be UINT8 or FLOAT32 with count=1");
+      const size_t bytes = intensity_it->datatype == PF::UINT8 ? 1U : 4U;
+      if (size_t(intensity_it->offset) + bytes > pc.point_step)
+        throw std::invalid_argument("Livox PointCloud2 intensity exceeds point_step");
+      fint = &*intensity_it;
+    }
+
     auto out = std::make_shared<CustomMsgLite>();
     out->timebase = int64_t(pc.header.stamp.sec) * 1000000000LL +
                     int64_t(pc.header.stamp.nanosec);
-    const size_t n = size_t(pc.width) * pc.height;
     out->point_num = uint32_t(n);
     out->points.resize(n);
 
-    int off_x = -1, off_y = -1, off_z = -1, off_int = -1, off_tag = -1,
-        off_line = -1, off_ot = -1;
-    for (const auto &f : pc.fields)
+    size_t i = 0;
+    for (uint32_t row = 0; row < pc.height; ++row)
     {
-      if (f.name == "x") off_x = f.offset;
-      else if (f.name == "y") off_y = f.offset;
-      else if (f.name == "z") off_z = f.offset;
-      else if (f.name == "intensity") off_int = f.offset;
-      else if (f.name == "tag") off_tag = f.offset;
-      else if (f.name == "line") off_line = f.offset;
-      else if (f.name == "offset_time") off_ot = f.offset;
-    }
-
-    const uint8_t *base = pc.data.data();
-    for (size_t i = 0; i < n; ++i)
-    {
-      const uint8_t *p = base + i * pc.point_step;
-      CustomPointLite &cp = out->points[i];
-      std::memcpy(&cp.x, p + off_x, 4);
-      std::memcpy(&cp.y, p + off_y, 4);
-      std::memcpy(&cp.z, p + off_z, 4);
-      cp.reflectivity = (off_int >= 0) ? *(p + off_int) : 0;
-      cp.tag = (off_tag >= 0) ? *(p + off_tag) : 0;
-      cp.line = (off_line >= 0) ? *(p + off_line) : 0;
-      if (off_ot >= 0) std::memcpy(&cp.offset_time, p + off_ot, 4);
-      else cp.offset_time = 0;
+      const uint8_t *row_base = pc.data.data() + size_t(row) * pc.row_step;
+      for (uint32_t col = 0; col < pc.width; ++col, ++i)
+      {
+        const uint8_t *p = row_base + size_t(col) * pc.point_step;
+        CustomPointLite &cp = out->points[i];
+        cp.x = ReadPointField<float>(p + fx->offset, pc.is_bigendian);
+        cp.y = ReadPointField<float>(p + fy->offset, pc.is_bigendian);
+        cp.z = ReadPointField<float>(p + fz->offset, pc.is_bigendian);
+        if (!std::isfinite(cp.x) || !std::isfinite(cp.y) ||
+            !std::isfinite(cp.z))
+          throw std::invalid_argument(
+              "Livox PointCloud2 xyz contains NaN or infinity");
+        cp.offset_time = ReadPointField<uint32_t>(p + fot->offset, pc.is_bigendian);
+        cp.tag = *(p + ftag->offset);
+        cp.line = *(p + fline->offset);
+        if (!fint)
+          cp.reflectivity = 0;
+        else if (fint->datatype == PF::UINT8)
+          cp.reflectivity = *(p + fint->offset);
+        else
+        {
+          const float intensity =
+              ReadPointField<float>(p + fint->offset, pc.is_bigendian);
+          if (!std::isfinite(intensity))
+            throw std::invalid_argument("Livox PointCloud2 intensity contains NaN or infinity");
+          cp.reflectivity = static_cast<uint8_t>(
+              std::clamp(intensity, 0.0F, 255.0F));
+        }
+      }
     }
     return out;
   }
+
+#ifdef COCOLIC_HAS_LIVOX_ROS_DRIVER2
+  CustomMsgLite::Ptr MsgManager::LivoxCustomMsgToLite(
+      const livox_ros_driver2::msg::CustomMsg &msg)
+  {
+    if (msg.point_num != msg.points.size())
+      throw std::invalid_argument("Livox CustomMsg point_num does not match points.size()");
+    auto out = std::make_shared<CustomMsgLite>();
+    out->timebase = static_cast<int64_t>(msg.timebase);
+    out->point_num = msg.point_num;
+    out->points.resize(msg.points.size());
+    for (size_t i = 0; i < msg.points.size(); ++i)
+    {
+      const auto &src = msg.points[i];
+      auto &dst = out->points[i];
+      dst.x = src.x; dst.y = src.y; dst.z = src.z;
+      if (!std::isfinite(dst.x) || !std::isfinite(dst.y) ||
+          !std::isfinite(dst.z))
+        throw std::invalid_argument(
+            "Livox CustomMsg xyz contains NaN or infinity");
+      dst.reflectivity = src.reflectivity;
+      dst.tag = src.tag; dst.line = src.line;
+      dst.offset_time = src.offset_time;
+    }
+    return out;
+  }
+#endif
 
   void MsgManager::LogInfo() const
   {
@@ -294,6 +534,14 @@ namespace cocolic
     // if (use_image_) m_size[2] = feature_tracker_node_->NumImageMsg();
     // LOG(INFO) << "imu/lidar/image msg left: " << m_size[0] << "/" << m_size[1]
     //           << "/" << m_size[2];
+    if (invalid_imu_count_ || nonmonotonic_imu_count_ ||
+        invalid_imu_orientation_count_)
+      RCLCPP_INFO(rclcpp::get_logger("cocolic"),
+                  "IMU drops: invalid=%llu non-monotonic=%llu; identity "
+                  "orientation fallbacks=%llu",
+                  static_cast<unsigned long long>(invalid_imu_count_),
+                  static_cast<unsigned long long>(nonmonotonic_imu_count_),
+                  static_cast<unsigned long long>(invalid_imu_orientation_count_));
   }
 
   void MsgManager::RemoveBeginData(int64_t start_time, // not used
@@ -616,13 +864,41 @@ namespace cocolic
 
   void MsgManager::IMUMsgHandle(const sensor_msgs::msg::Imu::ConstSharedPtr &imu_msg)
   {
-    int64_t t_last = cur_imu_timestamp_;
-    // ROS2 port: header.stamp.toSec()*S_TO_NS -> ns from sec/nanosec.
-    cur_imu_timestamp_ = int64_t(imu_msg->header.stamp.sec) * 1000000000LL +
-                         int64_t(imu_msg->header.stamp.nanosec);
-
     IMUData data;
-    IMUMsgToIMUData(imu_msg, data);
+    bool orientation_valid = false;
+    std::string error;
+    if (!IMUMsgToIMUData(imu_msg, data, if_normalized_, &orientation_valid,
+                         &error))
+    {
+      ++invalid_imu_count_;
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping invalid IMU sample (%s), count=%llu", error.c_str(),
+                  static_cast<unsigned long long>(invalid_imu_count_));
+      return;
+    }
+    if (data.timestamp <= cur_imu_timestamp_)
+    {
+      ++nonmonotonic_imu_count_;
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping duplicate/out-of-order IMU timestamp %lld after %lld, "
+                  "count=%llu",
+                  static_cast<long long>(data.timestamp),
+                  static_cast<long long>(cur_imu_timestamp_),
+                  static_cast<unsigned long long>(nonmonotonic_imu_count_));
+      return;
+    }
+    if (!orientation_valid)
+    {
+      ++invalid_imu_orientation_count_;
+      // Many LiDAR IMUs intentionally leave orientation unset.  Keep the
+      // fallback visible without emitting one warning per high-rate sample;
+      // FinishBag() reports the final aggregate count.
+      if (invalid_imu_orientation_count_ == 1)
+        RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                    "IMU orientation is absent/non-unit; using identity "
+                    "(further occurrences are summarized at end of bag)");
+    }
+    cur_imu_timestamp_ = data.timestamp;
 
     /// problem
     // data.timestamp -= add_extra_timeoffset_s_;
@@ -636,18 +912,25 @@ namespace cocolic
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr &vlp16_msg, int lidar_id)
   {
     RTPointCloud::Ptr vlp_raw_cloud(new RTPointCloud);
-    velodyne_feature_extraction_->ParsePointCloud(vlp16_msg, vlp_raw_cloud);
+    if (!velodyne_feature_extraction_->ParsePointCloud(vlp16_msg, vlp_raw_cloud))
+    {
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping rotating-LiDAR frame without ring and a supported "
+                  "per-point time field (time, t, or timestamp)");
+      return;
+    }
+
+    const int64_t stamp_ns = int64_t(vlp16_msg->header.stamp.sec) * 1000000000LL +
+                             int64_t(vlp16_msg->header.stamp.nanosec);
 
     // transform the input cloud to Lidar0 frame
     if (lidar_id != 0)
       pcl::transformPointCloud(*vlp_raw_cloud, *vlp_raw_cloud,
                                T_LktoL0_vec_[lidar_id]);
 
-    velodyne_feature_extraction_->LidarHandler(vlp_raw_cloud);
+    velodyne_feature_extraction_->LidarHandler(vlp_raw_cloud, stamp_ns);
 
     // ROS2 port: header.stamp.toSec()*S_TO_NS -> ns from sec/nanosec.
-    int64_t stamp_ns = int64_t(vlp16_msg->header.stamp.sec) * 1000000000LL +
-                       int64_t(vlp16_msg->header.stamp.nanosec);
     lidar_buf_.emplace_back();
     lidar_buf_.back().lidar_id = lidar_id;
     if (lidar_timestamp_end_)
@@ -666,7 +949,12 @@ namespace cocolic
     //
     // livox_feature_extraction_->ParsePointCloud(livox_msg, livox_raw_cloud);
     // livox_feature_extraction_->ParsePointCloudNoFeature(livox_msg, livox_raw_cloud);
-    livox_feature_extraction_->ParsePointCloudR3LIVE(livox_msg, livox_raw_cloud);
+    if (!livox_feature_extraction_->ParsePointCloudR3LIVE(livox_msg, livox_raw_cloud))
+    {
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping Livox frame that failed feature extraction");
+      return;
+    }
 
     LiDARCloudData data;
     data.lidar_id = lidar_id;
@@ -689,14 +977,27 @@ namespace cocolic
 
   void MsgManager::ImageMsgHandle(const sensor_msgs::msg::Image::ConstSharedPtr &msg)
   {
-    // ROS2 port: dropped debug image publish.
     cv_bridge::CvImagePtr cvImgPtr;
-    cvImgPtr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    try
+    {
+      cvImgPtr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    }
+    catch (const std::exception &error)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping undecodable Image: %s", error.what());
+      return;
+    }
     if (cvImgPtr->image.empty())
     {
       std::cout << RED << "[ImageMsgHandle get an empty img]" << RESET << std::endl;
       return;
     }
+    if (debug_input_image_pub_)
+      debug_input_image_pub_->publish(
+          *cv_bridge::CvImage(msg->header, sensor_msgs::image_encodings::BGR8,
+                              cvImgPtr->image)
+               .toImageMsg());
 
     image_buf_.emplace_back();
     // ROS2 port: header.stamp.toNSec() → ns from sec/nanosec.
@@ -710,6 +1011,53 @@ namespace cocolic
     if (image_buf_.back().image.cols == 640 || image_buf_.back().image.cols == 1280)
     {
       cv::resize(image_buf_.back().image, image_buf_.back().image, cv::Size(640, 512), 0, 0, cv::INTER_LINEAR);
+    }
+  }
+
+  cv::Mat MsgManager::DecodeCompressedImage(
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg)
+  {
+    if (!msg)
+      throw std::invalid_argument("CompressedImage pointer is null");
+    const auto decoded =
+        cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    if (!decoded || decoded->image.empty())
+      throw std::runtime_error("CompressedImage decoded to an empty image");
+    return decoded->image.clone();
+  }
+
+  void MsgManager::ImageMsgHandle(
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg)
+  {
+    cv::Mat decoded;
+    try
+    {
+      decoded = DecodeCompressedImage(msg);
+    }
+    catch (const std::exception &error)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("cocolic"),
+                  "Dropping undecodable CompressedImage: %s", error.what());
+      return;
+    }
+    if (debug_input_image_pub_)
+      debug_input_image_pub_->publish(
+          *cv_bridge::CvImage(msg->header, sensor_msgs::image_encodings::BGR8,
+                              decoded)
+               .toImageMsg());
+    image_buf_.emplace_back();
+    image_buf_.back().timestamp =
+        (int64_t(msg->header.stamp.sec) * 1000000000LL +
+         int64_t(msg->header.stamp.nanosec)) +
+        int64_t(img_time_offset_ * S_TO_NS);
+    image_buf_.back().image = decoded;
+    nerf_time_.push_back(image_buf_.back().timestamp);
+
+    if (image_buf_.back().image.cols == 640 ||
+        image_buf_.back().image.cols == 1280)
+    {
+      cv::resize(image_buf_.back().image, image_buf_.back().image,
+                 cv::Size(640, 512), 0, 0, cv::INTER_LINEAR);
     }
   }
 

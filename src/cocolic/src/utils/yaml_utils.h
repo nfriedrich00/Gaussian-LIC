@@ -19,7 +19,11 @@
 #pragma once
 
 #include <yaml-cpp/yaml.h>
+#include <cmath>
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 
 namespace yaml {
 
@@ -68,6 +72,34 @@ inline bool GetBool(const YAML::Node& node, const std::string& descri,
     ret = node[descri].as<bool>();
   }
   return ret;
+}
+
+// Read a required scalar that is used as a divisor, loop bound, or time step.
+// Reject zero, negative values, NaN, and missing/malformed keys at the point
+// where the configuration is consumed instead of failing later in processing.
+template <typename T>
+inline T RequirePositive(const YAML::Node& node, const std::string& descri,
+                         const std::string& context) {
+  if (!node[descri]) {
+    throw std::invalid_argument(context + "." + descri +
+                                " is required and must be greater than zero");
+  }
+
+  T value{};
+  try {
+    value = node[descri].as<T>();
+  } catch (const YAML::Exception& error) {
+    throw std::invalid_argument(context + "." + descri +
+                                " must be a valid positive scalar: " +
+                                error.what());
+  }
+  if (!(value > T{0}) ||
+      (std::is_floating_point<T>::value &&
+       !std::isfinite(static_cast<double>(value)))) {
+    throw std::invalid_argument(context + "." + descri +
+                                " must be greater than zero");
+  }
+  return value;
 }
 
 }  // namespace yaml

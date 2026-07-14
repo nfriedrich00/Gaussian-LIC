@@ -48,6 +48,10 @@ struct GaussianBackendConfig
   int optimization_seed{20260505};
 
   bool enable_density_control{false};
+  // Densification/pruning/reset are ROS2 experimental extensions and are not
+  // part of the public Gaussian-LIC mapper.  They require a second explicit
+  // opt-in so parity profiles cannot enable them accidentally.
+  bool enable_non_upstream_density_control{false};
   double prune_min_opacity{0.005};
   int max_foreground_gaussians{0};
   std::string max_foreground_prune_policy{"opacity"};

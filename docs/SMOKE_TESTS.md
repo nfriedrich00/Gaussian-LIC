@@ -4,13 +4,13 @@
 
 ```bash
 cd /home/frank/gaussian_lic_ros2
-./scripts/build_ros2.sh
+./scripts/build_ros2.sh --cpu-only
 ```
 
 Expected result:
 
 ```text
-Summary: 5 packages finished
+Summary: 7 packages finished
 ```
 
 Validate packaged launch profiles:
@@ -42,7 +42,7 @@ The shortest local check is:
 
 ```bash
 cd /home/frank/gaussian_lic_ros2
-./scripts/build_ros2.sh
+./scripts/build_ros2.sh --cpu-only
 ./scripts/smoke_test.sh --tf
 ```
 
@@ -55,6 +55,7 @@ ros2 launch gaussian_lic_bringup run_bag.launch.py \
   stub_mode:=false \
   synthetic_input:=true \
   use_sim_time:=false \
+  render_mode:=debug_cpu \
   use_composition:=true \
   rviz:=true
 ```
@@ -441,7 +442,7 @@ sed -n '1,12p' /tmp/gaussian_lic_save_test/point_cloud.ply
 tail -n 1 /tmp/gaussian_lic_save_test/point_cloud.ply
 ```
 
-This initializes foreground Gaussian tensors from keyframe-gated `MapperDataset` pending points, appends later pending keyframe points into the same tensor map, can run a small photometric Torch backward pass on visible foreground Gaussians, and can prune low-opacity or excess foreground tensors. The behavior matches the upstream initialize/extend/optimize/prune lifecycle at the tensor boundary. Upstream CUDA rasterization, full loss scheduling, and gradient-aware densification are still later porting slices.
+This CPU-oriented smoke initializes foreground Gaussian tensors from keyframe-gated `MapperDataset` pending points, appends later pending keyframe points into the same tensor map, and exercises photometric optimization and optional pruning at the tensor boundary. The `--full` build additionally provides the ported CUDA rasterizer, fused SSIM and sparse-depth loss, visibility-masked sparse Adam, upstream skybox/keyframe extension, and final render evaluation. Non-upstream pruning and densification remain explicit opt-ins behind `enable_non_upstream_density_control`.
 
 To exercise the raw frontend IMU orientation fallback on a real `frontend_sensor_raw` bag:
 
@@ -491,6 +492,11 @@ can be checked on machines without that package:
 ```bash
 ros2 run gaussian_lic_frontend livox_custom_to_pointcloud2 --self-test
 ```
+
+The output cloud stamp is constructed from `CustomMsg.timebase` (nanoseconds),
+not copied from `header.stamp`; `offset_time` remains a per-point nanosecond
+offset from that packet epoch. Malformed point counts, row-step overflow, and a
+`point_num`/array-length mismatch are rejected instead of being truncated.
 
 To exercise the FAST-LIVO2 camera-LiDAR transform and Torch image supervision on the official Bright bag:
 

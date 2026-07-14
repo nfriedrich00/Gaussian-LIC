@@ -173,11 +173,11 @@ Current ROS2 implementation status:
   into a square-root Jacobian + residual. `spline_marginalization_probe`
   asserts the recovered J^T J and J^T r match the manual Schur reduction on
   one- and two-residual-block scenarios.
-- Tracking package now reports 32/32 tests passing. The strict parity matrix
-  (`scripts/check_strict_parity_matrix.py`) still reports `required=12/12`
-  with FAST-LIVO/FAST-LIVO2/M2DGR/MCD/R3LIVE covered, because the additions
-  above are new libraries + probes only — `tracking_node` default behavior is
-  unchanged.
+- This intermediate checkpoint recorded 32/32 tracking tests and a
+  `required=12/12` strict matrix. Those counts are historical: the latest
+  TensorRT-enabled workspace verification on 2026-07-14 passes 63/63 tests
+  overall, including 41/41 `gaussian_lic_tracking` tests. The current strict
+  matrix total is tracked in `docs/RELEASE_MILESTONES.md`.
 - `gaussian_lic_tracking::spline::ContinuousTimeSlidingWindowEstimator`
   (port of Coco-LIC's `OdometryManager` streaming driver) combines
   `TrajectoryEstimator` and `SplineMarginalizationInfo` into the online
@@ -190,8 +190,8 @@ Current ROS2 implementation status:
   streaming, and marginalization regimes.
 - A new standalone ROS2 node, `continuous_time_node`, is the first
   executable that drives the ported continuous-time stack on live ROS2
-  topics. It runs alongside (not inside) `tracking_node` so the existing
-  12/12 strict matrix is unaffected. The node consumes both
+  topics. It runs alongside (not inside) `tracking_node` so the then-current
+  12/12 strict matrix was unaffected. The node consumes both
   `sensor_msgs/Imu` and `sensor_msgs/PointCloud2`; PointCloud2 points are
   iterated via `PointCloud2ConstIterator<float>`, filtered by range, and
   fed as plane correspondences against a configurable plane prior
