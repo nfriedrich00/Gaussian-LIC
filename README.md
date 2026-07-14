@@ -45,24 +45,51 @@ Highlights:
 
 ## Quick Start
 
+The CPU-only profile builds the native ROS2 middleware and diagnostic renderer;
+it does not require CUDA or libtorch:
+
 ```bash
 git clone https://github.com/KaiFeng-Frank/Gaussian-LIC2-ROS2-Jazzy.git
-cd gaussian_lic_ros2
+cd Gaussian-LIC2-ROS2-Jazzy
 
 source /opt/ros/jazzy/setup.bash
-# The full build installs the upstream LPIPS asset from this checkout.
-./scripts/fetch_upstreams.sh
 sudo apt update
-sudo apt install -y python3-rosdep
-# First use only: sudo rosdep init
+sudo apt install -y ros-dev-tools ripgrep
+# Initialize rosdep only when this machine has no default source list yet.
+if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+  sudo rosdep init
+fi
 rosdep update
 rosdep install --from-paths src --ignore-src -r -y
-# Uses CUDA_HOME (default /usr/local/cuda-12.8) and
-# TORCH_DIR (default ~/Software/libtorch/share/cmake/Torch).
-./scripts/build_ros2.sh --full
+./scripts/build_ros2.sh --cpu-only
 source install/setup.bash
-./scripts/smoke_test.sh --torch --render-mode rasterizer --tf
+./scripts/smoke_test.sh --tf
 ```
+
+This smoke test checks the ROS2 nodes, topics, services, diagnostic CPU preview,
+and TF output. It does not claim to exercise the CUDA Gaussian rasterizer.
+
+For the full Gaussian backend, first install a CUDA 12.x toolkit and a
+CUDA-enabled libtorch 2.x distribution that are compatible with each other.
+Then fetch the upstream LPIPS asset, point the build at those installations,
+and run the CUDA probes plus the CUDA-device smoke test:
+
+```bash
+./scripts/fetch_upstreams.sh
+export CUDA_HOME=/usr/local/cuda-12.8
+export TORCH_DIR="$HOME/Software/libtorch/share/cmake/Torch"
+test -x "$CUDA_HOME/bin/nvcc"
+test -f "$TORCH_DIR/TorchConfig.cmake"
+./scripts/build_ros2.sh --full --cmake-clean-cache
+source install/setup.bash
+ros2 run gaussian_lic_mapping rasterizer_probe
+ros2 run gaussian_lic_mapping torch_cuda_backend_probe
+./scripts/smoke_test.sh --torch --torch-device cuda --render-mode rasterizer --tf
+```
+
+The final three commands exercise the CUDA rasterizer and CUDA Gaussian backend,
+then validate their ROS2 topic/service integration. Override `CUDA_HOME` and
+`TORCH_DIR` when the toolkit or libtorch is installed elsewhere.
 
 Use `./scripts/build_ros2.sh --full --with-tensorrt` for any dataset profile
 whose `depth_completion` setting is `true`. The launch file accepts
@@ -130,7 +157,10 @@ frame live mapper feedback, and measured PSNR/ATE ablations documented in
 
 ```text
 src/                         ROS2 packages for messages, tracking, mapping, and tools
-config/                      Dataset and runtime configuration examples
+src/gaussian_lic_bringup/config/
+                             Mapper dataset and runtime configuration profiles
+src/cocolic/config/          Native continuous-time tracking configurations
+run_lio/config/              Additional replay and validation configurations
 scripts/                     Build, replay, conversion, validation, and audit utilities
 docs/                        Public validation reports and engineering notes
 docker/                      Jazzy container environment
@@ -142,13 +172,17 @@ external/                    Upstream source inventory
 This repository intentionally does not commit:
 
 - raw datasets or rosbag2/MCAP conversions
-- generated trajectories, rendered images, point clouds, or maps
+- bulk rendered images, point clouds, maps, or uncurated experiment bundles
 - local TensorRT engines or GPU-specific binary artifacts
 - large upstream baseline bundles
 
-The public contract is therefore source plus validation metadata. To reproduce a
-dataset-level report, obtain the relevant dataset/baseline artifacts, configure
-the local paths, and run the scripts referenced in the matching `docs/` report.
+Small reference/baseline trajectories and selected validation outputs under
+`baseline/`, `run_lio/data/`, and `results/` are versioned when they are needed
+to substantiate a report. The public contract is therefore source plus this
+curated validation evidence, not the raw datasets or complete generated output.
+To reproduce a dataset-level report, obtain the relevant dataset/baseline
+artifacts, configure the local paths, and run the scripts referenced in the
+matching `docs/` report.
 
 ## Platform
 

@@ -6,8 +6,6 @@
   <maintainer email="frank@example.com">Frank</maintainer>
   <license>GPL-3.0-or-later</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
-
   <exec_depend>gaussian_lic_tools</exec_depend>
   <exec_depend>gaussian_lic_frontend</exec_depend>
   <exec_depend>gaussian_lic_mapping</exec_depend>

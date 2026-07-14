@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 ENABLE_TORCH=false
+TORCH_DEVICE="cpu"
 PUBLISH_TF=false
 USE_COMPOSITION=false
 FRONTEND_ADAPTER=false
@@ -22,12 +23,14 @@ MINIMAL_INPUTS=false
 
 usage() {
   cat <<'EOF'
-Usage: scripts/smoke_test.sh [--torch] [--tf] [--composition] [--frontend-adapter] [--frontend-odometry-input] [--sensor-qos RELIABILITY] [--config FILE] [--render-mode MODE] [--skip-rendered-data-check] [--image-color-fallback-check] [--optional-depth-check] [--minimal-inputs] [--bag DIR] [--timeout SEC] [--save-dir DIR]
+Usage: scripts/smoke_test.sh [--torch] [--torch-device DEVICE] [--tf] [--composition] [--frontend-adapter] [--frontend-odometry-input] [--sensor-qos RELIABILITY] [--config FILE] [--render-mode MODE] [--skip-rendered-data-check] [--image-color-fallback-check] [--optional-depth-check] [--minimal-inputs] [--bag DIR] [--timeout SEC] [--save-dir DIR]
 
 Runs the synthetic ROS2 mapping smoke test and verifies published outputs.
 
 Options:
   --torch         Also verify Torch Gaussian map topic and SaveMap service.
+  --torch-device DEVICE
+                  Torch Gaussian device for --torch: cpu, cuda, or auto. Default: cpu.
   --tf            Enable and verify map -> camera TF output.
   --composition   Load mapping_node as a composable rclcpp component.
   --frontend-adapter
@@ -59,6 +62,10 @@ while [[ $# -gt 0 ]]; do
     --torch)
       ENABLE_TORCH=true
       shift
+      ;;
+    --torch-device)
+      TORCH_DEVICE="$2"
+      shift 2
       ;;
     --tf)
       PUBLISH_TF=true
@@ -147,6 +154,16 @@ case "${RENDER_MODE}" in
     ;;
   *)
     echo "Invalid --render-mode: ${RENDER_MODE}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+case "${TORCH_DEVICE}" in
+  cpu|cuda|auto)
+    ;;
+  *)
+    echo "Invalid --torch-device: ${TORCH_DEVICE}" >&2
     usage >&2
     exit 2
     ;;
@@ -250,7 +267,7 @@ if [[ "${ENABLE_TORCH}" == "true" ]]; then
   launch_args+=(
     enable_torch_camera_conversion:=true
     enable_torch_gaussian_init:=true
-    torch_gaussian_device:=cpu
+    torch_gaussian_device:="${TORCH_DEVICE}"
   )
 elif [[ "${IMAGE_COLOR_FALLBACK_CHECK}" == "true" || "${MINIMAL_INPUTS}" == "true" ]]; then
   launch_args+=(
