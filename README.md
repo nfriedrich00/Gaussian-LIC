@@ -1,4 +1,4 @@
-# Gaussian-LIC ROS2
+# Gaussian-LIC2 ROS2 Jazzy
 
 Native ROS2 Jazzy engineering port of
 [Gaussian-LIC / Gaussian-LIC2](https://github.com/APRIL-ZJU/Gaussian-LIC) for
@@ -46,7 +46,7 @@ Highlights:
 ## Quick Start
 
 ```bash
-git clone https://github.com/KaiFeng-Frank/gaussian_lic_ros2.git
+git clone https://github.com/KaiFeng-Frank/Gaussian-LIC2-ROS2-Jazzy.git
 cd gaussian_lic_ros2
 
 source /opt/ros/jazzy/setup.bash
