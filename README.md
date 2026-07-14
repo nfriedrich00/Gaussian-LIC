@@ -144,6 +144,7 @@ archived upstream references are defective.
 | Strict multi-dataset parity matrix | [`docs/strict_parity_matrix_report.md`](docs/strict_parity_matrix_report.md) |
 | Paper-completion audit | [`docs/paper_completion_report.md`](docs/paper_completion_report.md) |
 | GL2 closed-loop tracking and 3DGS mapping results | [`docs/GL2_RESULTS.md`](docs/GL2_RESULTS.md) |
+| Native tracking production preset | [`docs/native_production_preset.json`](docs/native_production_preset.json) |
 | Input data audit contract | [`docs/strict_data_status.md`](docs/strict_data_status.md) |
 | Historical rejected diagnostics | [`docs/HISTORICAL_DIAGNOSTICS.md`](docs/HISTORICAL_DIAGNOSTICS.md) |
 

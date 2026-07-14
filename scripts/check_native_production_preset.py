@@ -330,13 +330,18 @@ def check_script_contract(manifest: dict[str, Any], script: str, errors: list[st
 def check_docs(manifest: dict[str, Any], readme: str, roadmap: str, errors: list[str]) -> None:
     accepted = manifest["accepted_evidence"]
     production_report = accepted["report"]
-    for label, text in (("README.md", readme), ("docs/ROADMAP.md", roadmap)):
-        require_snippet(text, production_report, label, errors)
-        require_snippet(text, "1.346", label, errors)
-        require_snippet(text, "0.045", label, errors)
-        for forbidden in manifest.get("forbidden_readme_snippets", []):
-            if forbidden in text:
-                errors.append(f"{label} contains stale native-preset snippet: {forbidden}")
+    require_snippet(
+        readme,
+        "docs/native_production_preset.json",
+        "README.md",
+        errors,
+    )
+    require_snippet(roadmap, production_report, "docs/ROADMAP.md", errors)
+    require_snippet(roadmap, "1.346", "docs/ROADMAP.md", errors)
+    require_snippet(roadmap, "0.045", "docs/ROADMAP.md", errors)
+    for forbidden in manifest.get("forbidden_readme_snippets", []):
+        if forbidden in readme:
+            errors.append(f"README.md contains stale native-preset snippet: {forbidden}")
 
 
 def verify_report_metrics(
