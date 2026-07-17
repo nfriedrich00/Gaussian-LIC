@@ -1,6 +1,7 @@
 import torch.nn as nn
 from .custom_blocks import CNBlock, NormLayer
 import torch
+import torch.nn.functional as F
 
 
 class Encoder(nn.Module):
@@ -74,6 +75,10 @@ class Decoder(nn.Module):
         x = ins[-1]
         for i in range(4, -1, -1):
             x = self.upsample_layers[i](x)
+            # Dynamically align spatial dimensions before concatenation
+            target_shape = ins[i].shape[2:]
+            if x.shape[2:] != target_shape:
+                x = F.interpolate(x, size=target_shape, mode='bilinear', align_corners=False)
             x = torch.cat([ins[i], x], dim=1)
             x = self.fusion_layers[i](x)
             x = self.stages[i](x)
