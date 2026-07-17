@@ -13,4 +13,10 @@ python export_onnx_512_640.py
 echo ">>> Export ONNX (480x640)"
 python export_onnx_480_640.py
 
+echo ">>> Export ONNX (720x1280)"
+python export_onnx_720_1280.py
+
+echo ">>> Export ONNX (1080x1920)"
+python export_onnx_1080_1920.py
+
 echo ">>> All ONNX exports finished successfully."

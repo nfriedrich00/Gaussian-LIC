@@ -25,4 +25,18 @@ $TRT_BIN \
   --fp16 \
   --optShapes=rgb:1x3x480x640,depth:1x1x480x640,mask:1x1x480x640
 
+echo ">>> Building TensorRT engine: 720x1280"
+$TRT_BIN \
+  --onnx=spnet_720_1280.onnx \
+  --saveEngine=spnet_720_1280.engine \
+  --fp16 \
+  --optShapes=rgb:1x3x720x1280,depth:1x1x720x1280,mask:1x1x720x1280
+
+echo ">>> Building TensorRT engine: 1080x1920"
+$TRT_BIN \
+  --onnx=spnet_1080_1920.onnx \
+  --saveEngine=spnet_1080_1920.engine \
+  --fp16 \
+  --optShapes=rgb:1x3x1080x1920,depth:1x1x1080x1920,mask:1x1x1080x1920
+
 echo ">>> TensorRT engine build finished."

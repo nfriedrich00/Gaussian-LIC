@@ -70,6 +70,8 @@ public:
         std::string pkg_path = ros::package::getPath("gaussian_lic");
         if (height == 512 && width == 640) engine_path = pkg_path + "/ckpt/spnet_512_640.engine";
         if (height == 480 && width == 640) engine_path = pkg_path + "/ckpt/spnet_480_640.engine";
+        if (height == 720 && width == 1280) engine_path = pkg_path + "/ckpt/spnet_720_1280.engine";
+        if (height == 1080 && width == 1920) engine_path = pkg_path + "/ckpt/spnet_1080_1920.engine";
 
         sh_degree = node["sh_degree"].as<int>();
         white_background = node["white_background"].as<bool>();
