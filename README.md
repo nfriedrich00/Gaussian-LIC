@@ -5,9 +5,9 @@ Native ROS2 Jazzy engineering port of
 LiDAR-Inertial-Camera Gaussian Splatting SLAM.
 
 This repository is not a ROS1 bridge wrapper. It keeps the ROS2 middleware,
-tracking frontend, mapper contract, CUDA/Torch Gaussian mapping path, offline
-artifact tooling, and validation scripts in one workspace so each part can be
-ported and tested independently.
+the ported Coco-LIC front-end, the mapper contract, the CUDA/Torch Gaussian
+mapping path, offline artifact tooling, and validation scripts in one
+workspace so each part can be ported and tested independently.
 
 ## Forked / Ported From
 
@@ -20,9 +20,6 @@ tooling, and reproducibility packaging around that upstream work.
 
 The upstream authors have been informed about this ROS2 port.
 
-For the audited Chinese ledger that separates the upstream v1→LIC2 algorithm
-upgrade from the LIC2→ROS2/Jazzy port and this repository's new extensions, see
-[`docs/ROS1_TO_ROS2_CHANGES_CN.md`](docs/ROS1_TO_ROS2_CHANGES_CN.md).
 
 ## Current Status
 
@@ -34,14 +31,15 @@ must be supplied separately.
 
 Highlights:
 
-- ROS2 Jazzy workspace with native message, launch, frontend, tracking, mapping,
-  and offline tooling packages.
+- ROS2 Jazzy workspace with native message, launch, frontend-adapter, the
+  ported Coco-LIC front-end, mapping, and offline tooling packages.
 - Mapper input contract for `/points_for_gs`, `/pose_for_gs`,
   `/image_for_gs`, `/camera_info_for_gs`, `/depth_for_gs`, and `/imu_for_gs`.
 - Optional CUDA/libtorch Gaussian mapping path with rendered feedback for
   closed-loop tracking experiments.
-- Continuous-time LIC tracking surface with LiDAR, IMU, visual, and
-  render-photometric factor plumbing.
+- Camera Factor Option 2 pose-level render feedback inside the Coco-LIC
+  continuous-time factor graph, alongside the earlier patch-photometric
+  coupling (see the section below).
 - Dataset profiles and conversion scripts for FAST-LIVO, FAST-LIVO2, M2DGR,
   MCD, and R3LIVE style inputs.
 - Validation reports kept under `docs/` for strict parity, paper-completion
@@ -127,7 +125,7 @@ optimization, exposure, density-control opt-ins, final evaluation, and
 inactivity finalization, is documented in
 [`docs/GAUSSIAN_MAPPER_PARITY.md`](docs/GAUSSIAN_MAPPER_PARITY.md).
 
-Run the native tracking probe suite:
+Run the workspace test suite:
 
 ```bash
 colcon test --event-handlers console_direct+
@@ -136,6 +134,35 @@ colcon test-result --verbose
 
 For real datasets, place bags and generated artifacts outside git and point the
 provided scripts/configs at those local paths.
+
+## Render Feedback (Camera Factor Option 2)
+
+The Coco-LIC front-end can consume the mapper's `RenderedFeedback` stream live
+(`gs_live_publish` with lockstep pacing) and add one pose-level factor per
+image frame: a fixed-reference warp Gauss-Newton alignment of the current
+image against the latest rendered keyframe (rendered image, observed depth,
+source pose), whose converged pose enters the continuous-time factor graph as
+an absolute `IMUPoseFactorNURBS` measurement. The coupling is controlled by
+`enable_render_se3_pose` and the `render_se3_*` keys; per-exit-path gate
+counters make a silently inert configuration visible.
+
+A/B harnesses:
+
+```bash
+./scripts/gl2_reproduce.sh degraded-baseline   # weakened-LiDAR pair on CBD
+./scripts/gl2_reproduce.sh degraded-se3pose
+./scripts/gl2_reproduce.sh asym-baseline       # transient good->bad->good window
+./scripts/gl2_reproduce.sh asym-se3pose
+./scripts/degen_ab.sh baseline                 # FAST-LIVO LiDAR_Degenerate pair
+./scripts/degen_ab.sh se3pose
+```
+
+Measured boundary across these testbeds: the factor stays active on 95%+ of
+frames yet is redundant whenever the front-end keeps any competing visual
+anchor; with the native PnP factors disabled on the truly degenerate sequence
+it substantially recovers trajectory shape (loop-closure drift 26.1% to
+22.1%, y-span restored to the reference scale), while global rescue remains
+limited because the online map drifts with the odometry that builds it.
 
 ## Evidence Snapshot
 
@@ -148,7 +175,6 @@ archived upstream references are defective.
 | Strict multi-dataset parity matrix | [`docs/strict_parity_matrix_report.md`](docs/strict_parity_matrix_report.md) |
 | Paper-completion audit | [`docs/paper_completion_report.md`](docs/paper_completion_report.md) |
 | GL2 closed-loop tracking and 3DGS mapping results | [`docs/GL2_RESULTS.md`](docs/GL2_RESULTS.md) |
-| Native tracking production preset | [`docs/native_production_preset.json`](docs/native_production_preset.json) |
 | Input data audit contract | [`docs/strict_data_status.md`](docs/strict_data_status.md) |
 | Historical rejected diagnostics | [`docs/HISTORICAL_DIAGNOSTICS.md`](docs/HISTORICAL_DIAGNOSTICS.md) |
 
@@ -161,10 +187,10 @@ frame live mapper feedback, and measured PSNR/ATE ablations documented in
 ## Repository Layout
 
 ```text
-src/                         ROS2 packages for messages, tracking, mapping, and tools
+src/                         ROS2 packages for messages, the Coco-LIC front-end, mapping, and tools
 src/gaussian_lic_bringup/config/
                              Mapper dataset and runtime configuration profiles
-src/cocolic/config/          Native continuous-time tracking configurations
+src/cocolic/config/          Coco-LIC continuous-time odometry configurations
 run_lio/config/              Additional replay and validation configurations
 scripts/                     Build, replay, conversion, validation, and audit utilities
 docs/                        Public validation reports and engineering notes
@@ -208,9 +234,11 @@ surface for this port.
 - This is an unofficial research/engineering port, not an APRIL-ZJU release.
 - Dataset-level claims depend on valid references; broken zero-trajectory
   upstream references are treated as evidence defects, not silently accepted.
-- Closed-loop render-photometric coupling has been measured as stable and useful
-  under degraded tracking settings, but larger gains need loop/revisit datasets
-  rather than more scalar tuning on non-revisit sequences.
+- Closed-loop render feedback (patch-photometric and the pose-level Camera
+  Factor Option 2) measures as redundant while the front-end retains any
+  competing visual anchor; it recovers trajectory shape only under true LiDAR
+  degeneracy with the native visual factors disabled, and global rescue stays
+  bounded by the map drifting with the odometry that builds it.
 
 ## Detailed Notes
 
