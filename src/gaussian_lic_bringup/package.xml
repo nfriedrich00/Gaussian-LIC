@@ -9,7 +9,6 @@
   <exec_depend>gaussian_lic_tools</exec_depend>
   <exec_depend>gaussian_lic_frontend</exec_depend>
   <exec_depend>gaussian_lic_mapping</exec_depend>
-  <exec_depend>gaussian_lic_tracking</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
