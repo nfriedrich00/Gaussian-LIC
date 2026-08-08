@@ -9,6 +9,10 @@
  * pull common_lib.h). It exposes exactly the ctor + 3 methods odometry_manager
  * calls: UpdateVisualGlobalMap / UpdateVisualSubMap / AssociateNewPointsToCurrentImg.
  *
+ * ROS2_PORT_NOTE [NEW][BEHAVIOR]: this is a three-method compatibility
+ * front-end, not complete R3LIVE. Its wall-clock Global_map projection service
+ * is disabled; offline replay refreshes candidates synchronously.
+ *
  * Effective VIO params are upstream's offline defaults + hardcoded overrides
  * (no r3live launch yaml ships with Coco-LIC; values verified from r3live.hpp).
  */
@@ -72,8 +76,8 @@ namespace cocolic
     }
     ~R3LIVE() {}
 
-    // The 3 methods Coco-LIC's odometry_manager calls (defined in r3live_slim.cpp,
-    // ported verbatim from r3live_vio.cpp).
+    // The three bodies retain upstream visual logic; constructor, scheduling
+    // and parameter sourcing are port-specific.
     void UpdateVisualGlobalMap(const PosCloud::Ptr &cloud_undistort, double lidar_scan_time_max);
     void UpdateVisualSubMap(const cv::Mat &img_in, double img_time,
                             const Eigen::Quaterniond &q_wc, const Eigen::Vector3d &t_wc);

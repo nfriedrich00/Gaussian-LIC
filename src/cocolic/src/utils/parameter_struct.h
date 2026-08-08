@@ -120,6 +120,10 @@ struct ExtrinsicParam {
       return;
     }
 
+    // ROS2_PORT_NOTE [BEHAVIOR][SCHEMA BREAK]: unlike ROS1, this ignores every
+    // Extrinsics.time_offset and fixes all sensor extrinsic offsets at zero.
+    // Camera time is pre-shifted once by camera.yaml:img_time_offset in
+    // MsgManager; custom IMU/LiDAR offsets must be migrated explicitly.
     double t_s = 0;
     t_offset_ns = t_s * 1e9;
     std::vector<double> params_vec;

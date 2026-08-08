@@ -1,5 +1,9 @@
 # Coco-LIC Frontend Inventory
 
+> Historical checkpoint. Its test totals and “not yet ported” statements are
+> not current after the embedded Coco-LIC package and 72-test workspace surface
+> landed. See [ROS1_TO_ROS2_CHANGES_CN.md](ROS1_TO_ROS2_CHANGES_CN.md).
+
 `external/Gaussian-LIC` still delegates odometry/tracking to Coco-LIC contract
 topics. The native ROS2 tracker work therefore uses `external/Coco-LIC` as the
 available continuous-time frontend surface.

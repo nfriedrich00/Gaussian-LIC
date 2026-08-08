@@ -1,5 +1,7 @@
 odometry_mode: 1  # LICO = 1 (full LiDAR-Inertial-Camera, slimmed R3LIVE front-end)
 
+# ROS2_PORT_NOTE [COMPAT]: unused by the Jazzy executable; retained for old
+# scripts. Nested YAMLs resolve relative to this main profile's directory.
 project_path: .
 
 lidar_yaml: /fastlivo2/lidar.yaml

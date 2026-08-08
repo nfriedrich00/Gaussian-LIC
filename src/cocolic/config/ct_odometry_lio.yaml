@@ -1,7 +1,7 @@
 odometry_mode: 0  # LIO = 0, LICO = 1  (ROS2 port milestone: LiDAR-Inertial first)
 
-# ROS2 port: project_path was a ROS launch param; the OdometryManager ctor reads
-# it from here. Sub-yamls resolve as project_path + "/config" + <x>_yaml.
+# ROS2_PORT_NOTE [COMPAT]: unused by the Jazzy executable; retained for old
+# scripts. Nested YAMLs resolve relative to this main profile's directory.
 project_path: .
 
 lidar_yaml: /fastlivo2/lidar.yaml

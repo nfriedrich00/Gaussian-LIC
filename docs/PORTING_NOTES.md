@@ -1,5 +1,10 @@
 # Porting Notes
 
+> Historical engineering log: sections below were appended at different port
+> milestones and some “not yet ported” wording records an earlier state. For
+> the current, audited ROS1 v1→LIC2→Jazzy classification and complete file
+> disposition, use [ROS1_TO_ROS2_CHANGES_CN.md](ROS1_TO_ROS2_CHANGES_CN.md).
+
 ## Project Direction
 
 The port should be native ROS2, not only a ROS1 bridge wrapper. Bridge support can exist as a compatibility path, but the main README and launch flow should target native ROS2 nodes.
@@ -34,7 +39,9 @@ Outputs:
 - Use configurable sensor-data QoS for image, point cloud, pose, camera info, depth, and IMU subscriptions. Defaults are `best_effort`, `keep_last`, depth `5`; `sensor_qos_reliability:=reliable` is available for reliable rosbag2 or driver outputs.
 - Keep estimator timestamp math in signed `int64_t` nanoseconds. Do not replace ROS1 `ros::Time` math with `rclcpp::Time` or double seconds inside B-spline, IMU, LiDAR deskew, or frame-sync code.
 - Strict replay keeps estimator mutation stamp-ordered and serialized; mapping composition may use a multi-threaded executor because sensor queues and GPU/map state are isolated into protected callback groups.
-- Use lifecycle nodes for long-running mapping/tracking components.
+- Current implementation uses ordinary `rclcpp::Node` classes with explicit
+  callback groups, services and finalization. Lifecycle conversion remains a
+  possible future design, not a description of the present source.
 - Keep GPU/CUDA code isolated from middleware glue.
 - `mapping_node` is available as both a standalone executable and an `rclcpp_components` plugin; launch with `use_composition:=true` to load it in `component_container_mt`, allowing mutually-exclusive sensor and GPU callback groups to run concurrently.
 - Keep launch files dataset-agnostic; put dataset paths and remaps in config.
@@ -69,7 +76,7 @@ and republishes into the mapper contract:
 /imu_for_gs
 ```
 
-Odometry messages are converted into `PoseStamped` for `/pose_for_gs`. The adapter also publishes `/gaussian_lic/frontend/odometry`, `/gaussian_lic/frontend/path`, and optional TF from any incoming pose or odometry so downstream visualization and regression tools can use the same frontend surface before the full continuous-time odometry algorithm is ported. For raw bags without odometry, `imu_pose_fallback:=true` integrates IMU angular velocity into a non-identity orientation fallback at point-cloud timestamps; this is an executable fallback for current artifact generation, not a replacement for the full Gaussian-LIC2 continuous-time frontend.
+Odometry messages are converted into `PoseStamped` for `/pose_for_gs`. The adapter also publishes `/gaussian_lic/frontend/odometry`, `/gaussian_lic/frontend/path`, and optional TF from any incoming pose or odometry so downstream visualization and regression tools can use the adapter surface independently of the newer tracking nodes. For raw bags without odometry, `imu_pose_fallback:=true` integrates IMU angular velocity into a non-identity orientation fallback at point-cloud timestamps; this is an executable fallback for contract/artifact generation, not a replacement for LIO/VIO or the repository's continuous-time tracker.
 
 For FAST-LIVO2 raw bags, `pointcloud_transform_profile:=fastlivo2` applies the released camera-LiDAR extrinsic profile before publishing `/points_for_gs`. This turns `/livox/lidar` points into the camera frame using the Coco-LIC/FAST-LIVO2 calibration (`R_cl`, `P_cl`) and lets image-projection color and the Torch photometric optimizer receive visible camera-frame supervision even when the strict frontend odometry is not available.
 

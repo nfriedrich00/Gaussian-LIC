@@ -2,10 +2,12 @@
 
 This document records the algorithm boundary implemented by
 `gaussian_lic_mapping`. The reference is `external/Gaussian-LIC/src/gaussian.cpp`;
-ROS2 middleware changes are allowed, while the default CUDA mapping behavior is
-kept equivalent to the ROS1 implementation.
+ROS2 middleware changes are allowed, while the standard dataset profiles on a
+full Torch/CUDA build keep the CUDA mapping behavior equivalent to the ROS1
+implementation. The naked node's conservative parameter defaults and the
+CPU/debug renderer are diagnostic paths, not this parity claim.
 
-## Upstream-equivalent default path
+## Upstream-equivalent standard-profile path
 
 | Stage | ROS2 behavior |
 |---|---|

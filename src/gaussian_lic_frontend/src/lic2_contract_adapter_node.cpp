@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [NEW]: Gaussian-LIC ROS1 supplied no odometry frontend source;
+// this ROS2 adapter only converts raw streams plus an external Pose/Odometry to
+// the LIC2 mapper contract.  Identity/gyro-only IMU fallback is executable
+// scaffolding, not LIO/VIO or upstream tracking parity.
+
 #include <algorithm>
 #include <array>
 #include <cctype>

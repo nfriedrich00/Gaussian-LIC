@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [PARITY][COMPAT]: kernel coefficients/math are upstream LIC2;
+// Jazzy adds a namespaced Torch autograd surface, current data_ptr access,
+// tensor validation and CUDA launch checks in the wrapper.
+
 #include "gaussian_lic_mapping/cuda/fused_ssim.hpp"
 
 #include <c10/cuda/CUDAException.h>

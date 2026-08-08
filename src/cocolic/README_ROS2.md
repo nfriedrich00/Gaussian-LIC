@@ -1,5 +1,9 @@
 # Coco-LIC ROS 2 package notes
 
+The workspace-level audit that distinguishes this embedded compatibility port
+from Gaussian-LIC2's new adapter/tracking implementations is
+[`docs/ROS1_TO_ROS2_CHANGES_CN.md`](../../docs/ROS1_TO_ROS2_CHANGES_CN.md).
+
 Run the installed package with:
 
 ```bash

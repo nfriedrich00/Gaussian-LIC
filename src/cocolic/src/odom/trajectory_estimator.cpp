@@ -31,6 +31,10 @@
 #include <thread>
 #include <variant>
 
+// ROS2_PORT_NOTE [COMPAT][SAFETY]: residual math remains upstream-derived;
+// Ceres ownership and LocalParameterization moved to 2.2 Manifold semantics,
+// and rejected/non-finite residuals now release untransferred objects.
+
 namespace cocolic
 {
 

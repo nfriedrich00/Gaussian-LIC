@@ -1,5 +1,9 @@
 # Gaussian-LIC2 Surface Inventory
 
+> Historical checkpoint. Statements below about Coco-LIC or strict artifacts
+> being unported may have been superseded. The current classification is
+> [ROS1_TO_ROS2_CHANGES_CN.md](ROS1_TO_ROS2_CHANGES_CN.md).
+
 This inventory locks the public upstream surface used for the ROS2 Jazzy
 paper-level migration. It is based on `external/Gaussian-LIC` at
 `cd4c122dfad7e93255fe6862ac2c2b205e844786`.

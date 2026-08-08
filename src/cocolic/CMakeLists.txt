@@ -76,7 +76,10 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
 )
 
-# Core library: the ROS-agnostic continuous-time spline + params (verbatim).
+# ROS2_PORT_NOTE [BUILD]: this target keeps the upstream estimator core, but it
+# is not wholly ROS-agnostic or verbatim: it also contains the rewritten
+# rosbag2 ingest, ROS2 output, safety fixes, and optional mapper coupling. See
+# docs/ROS1_TO_ROS2_CHANGES_CN.md for the classification.
 add_library(cocolic_core STATIC
   src/spline/trajectory.cpp
   src/utils/parameter_struct.cpp

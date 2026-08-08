@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [ROS_API][SAFETY]: this hand parser intentionally handles
+// organized rows, padding, datatype/count/bounds, source endianness and packed
+// or scalar colors instead of assuming a PCL host layout.  See the exact input
+// contract in docs/ROS1_TO_ROS2_CHANGES_CN.md.
+
 #include <gaussian_lic_mapping/frame_data.hpp>
 
 #include <algorithm>

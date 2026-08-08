@@ -1,5 +1,10 @@
 # Upstream Inventory
 
+> Historical milestone inventory. Later commits completed CUDA mapper and
+> tracking surfaces that early “missing” entries below do not reflect. Use
+> [ROS1_TO_ROS2_CHANGES_CN.md](ROS1_TO_ROS2_CHANGES_CN.md) for the current
+> audited version-to-version ledger.
+
 Fetched upstream revisions:
 
 - Gaussian-LIC/Gaussian-LIC2 primary upstream: `cd4c122`

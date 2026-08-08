@@ -16,6 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+// ROS2_PORT_NOTE [PARITY][SAFETY]: the rasterizer math is upstream LIC2.  The
+// active-lane guards and UINT_MAX invalid-tile sentinel below prevent padded
+// cooperative lanes from emitting/closing an out-of-range tile; they only
+// change malformed or inactive work, not valid splat equations.
+
 #include "rasterizer_impl.h"
 #include <iostream>
 #include <fstream>
@@ -180,6 +185,8 @@ __global__ void duplicateWithKeys(
 		}
 	}
 
+	// ROS2_PORT_NOTE [SAFETY]: never let a padded inactive lane fill another
+	// Gaussian's reserved range.
 	while (active && off < offset_to)
 	{
 		uint64_t key = (uint32_t) -1;
@@ -199,6 +206,8 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;
+	// ROS2_PORT_NOTE [SAFETY]: filler keys sort last with UINT_MAX and must not
+	// index the per-tile range array.
 	bool valid_tile = currtile != (uint32_t) -1;
 
 	if (idx == 0) {

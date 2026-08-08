@@ -86,6 +86,10 @@ namespace cocolic
 
     std::string cam_yaml = node["camera_yaml"].as<std::string>();
     YAML::Node cam_node = YAML::LoadFile(ResolveConfigPath(config_path, cam_yaml));
+    // ROS2_PORT_NOTE [BEHAVIOR][SCHEMA BREAK]: positive img_time_offset moves
+    // queued images later. This is read before the LIO/LICO branch, so even LIO
+    // needs the new key; a ROS1 camera YAML containing only the extrinsic
+    // time_offset does not load unchanged.
     img_time_offset_ = cam_node["img_time_offset"].as<double>();
 
     // add_extra_timeoffset_s_ =

@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [ROS_API][SAFETY]: ROS1 Dataset frame assembly was extracted
+// into explicit ROS2 message conversion.  It defines PointCloud2 layout/
+// endianness, image/depth encoding, coordinate-frame and per-frame CameraInfo
+// snapshot semantics; malformed input now fails or drops deterministically.
+
 #pragma once
 
 #include <cstddef>

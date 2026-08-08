@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [ROS_API][PARITY]: ROS1 mapping.{h,cpp} was split into this
+// ordinary rclcpp::Node plus frame_data, mapper_dataset, optimization_sampling
+// and torch_backend.  DDS queues/callback groups/status/services are ROS2
+// runtime work; the standard full-CUDA profiles select the upstream LIC2
+// Gaussian path.  See docs/ROS1_TO_ROS2_CHANGES_CN.md.
+
 #include <chrono>
 #include <algorithm>
 #include <atomic>
@@ -330,6 +336,11 @@ public:
 #endif
     }
 #ifdef GAUSSIAN_LIC_ENABLE_TORCH
+    // ROS2_PORT_NOTE [BEHAVIOR]: these conservative naked-node defaults make a
+    // middleware/CPU diagnostic node start without libtorch.  The five
+    // standard dataset profiles override them to enable the full LIC2
+    // camera/init/extend/optimization path; "default parity" always means a
+    // standard profile plus a full Torch/CUDA build.
     enable_torch_camera_conversion_ = declare_parameter<bool>("enable_torch_camera_conversion", false);
     enable_torch_gaussian_init_ = declare_parameter<bool>("enable_torch_gaussian_init", false);
     enable_torch_gaussian_extend_ = declare_parameter<bool>("enable_torch_gaussian_extend", true);
@@ -384,6 +395,9 @@ public:
 #endif
     const bool density_control_requested =
       declare_parameter<bool>("enable_torch_gaussian_pruning", false);
+    // ROS2_PORT_NOTE [NEW][NON-PARITY]: pruning/densification/opacity reset are
+    // not in the released LIC2 loop.  Keep the master gate and the individual
+    // option double-gate; standard profiles leave this false.
     backend_config_.enable_non_upstream_density_control =
       declare_parameter<bool>("enable_non_upstream_density_control", false);
     backend_config_.enable_density_control =

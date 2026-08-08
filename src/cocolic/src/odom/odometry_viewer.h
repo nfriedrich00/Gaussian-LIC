@@ -1,9 +1,10 @@
 /*
  * Coco-LIC ROS 2 visualization and TF bridge.
  *
- * This keeps the publisher surface used by the estimator while using native
- * ROS 2 publishers, messages and tf2.  Visualization remains observational:
- * it never feeds data back into estimation.
+ * ROS2_PORT_NOTE [ROS_API][BEHAVIOR]: the ROS1 publisher helper was reduced to
+ * the reachable estimator surface and moved to ROS2 messages/tf2 with
+ * configurable frames/topics. Visualization remains observational; mapper
+ * feedback is owned by OdometryManager.
  */
 #pragma once
 

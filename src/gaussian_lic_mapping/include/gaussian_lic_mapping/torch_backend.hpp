@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [PARITY][NEW]: the tensors, CUDA rasterization, losses,
+// SparseAdam, sampling and PLY/evaluation paths come from ROS1 LIC2's
+// gaussian/camera/renderer code.  Exposure and density-control members are
+// opt-in ROS2 extensions and are not upstream parity defaults.
+
 #pragma once
 
 #include <string>

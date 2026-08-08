@@ -18,7 +18,9 @@
 
 #pragma once
 
-// ROS2 Jazzy port: dropped ROS1 ros/rosbag/livox_ros_driver and ROS1 sensor_msgs.
+// ROS2_PORT_NOTE [ROS_API][INPUT CONTRACT]: ROS1 rosbag/driver1 callbacks were
+// replaced by rosbag2 CDR, optional driver2 CustomMsg and strict PointCloud2
+// validation. Invalid layouts/timestamps now fail or drop deterministically.
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_storage/storage_options.hpp>
 #include <rclcpp/serialization.hpp>

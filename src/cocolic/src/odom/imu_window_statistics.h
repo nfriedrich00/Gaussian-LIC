@@ -18,8 +18,10 @@ struct ImuWindowStatistics
   double accel_stddev = 0.0;
 };
 
+// ROS2_PORT_NOTE [SAFETY][BEHAVIOR]: centralizes the duplicated ROS1 loops,
+// makes empty/singleton windows finite and fixes a second-pass comparison that
+// mixed maxTimeNURBS() seconds with sample timestamps in nanoseconds.
 // Compute statistics for the half-open nanosecond interval [begin_ns, end_ns).
-// Empty and singleton windows intentionally return finite zero deviations.
 template <typename ImuContainer>
 ImuWindowStatistics ComputeImuWindowStatistics(
     const ImuContainer &samples, int64_t begin_ns, int64_t end_ns)

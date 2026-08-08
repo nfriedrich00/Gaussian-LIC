@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [COMPAT]: TensorRT API/resource-management rewrite of the
+// ROS1 LIC2 SPNet runner, not a new ROS2 depth algorithm.  Bias acceptance,
+// empty-patch selection and source-sparse-depth supervision are implemented at
+// the frame/backend boundary and documented in ROS1_TO_ROS2_CHANGES_CN.md.
+
 #include <gaussian_lic_mapping/depth_completer.hpp>
 
 #include <cuda_runtime_api.h>

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+
+// ROS2_PORT_NOTE [NEW][SAFETY]: ROS2-native PointCloud2 schema/overflow/
+// row-padding validation for the adapter.  It has no Gaussian-LIC ROS1 source
+// counterpart and does not estimate motion.
 #pragma once
 
 #include <algorithm>

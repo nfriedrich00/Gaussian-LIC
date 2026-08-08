@@ -1,8 +1,8 @@
 // Port S5 ingest primitive test: verify rosbag2_cpp::Reader + CDR deserialization
 // can read the CBD_Building_01 frontend_raw db3 (the ROS2-native bag) and extract
 // /imu (sensor_msgs/Imu) + /livox/lidar (PointCloud2, Livox fields) — the data
-// the ported msg_manager will feed into the Coco-LIC pipeline. Standalone: no
-// estimator yet, just de-risking the ingest path before the full RunBag port.
+// the ported msg_manager feeds into the Coco-LIC pipeline. This remains an
+// ingest-only contract test; the full RunBag path exists separately.
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>

@@ -20,6 +20,10 @@ tooling, and reproducibility packaging around that upstream work.
 
 The upstream authors have been informed about this ROS2 port.
 
+For the audited Chinese ledger that separates the upstream v1→LIC2 algorithm
+upgrade from the LIC2→ROS2/Jazzy port and this repository's new extensions, see
+[`docs/ROS1_TO_ROS2_CHANGES_CN.md`](docs/ROS1_TO_ROS2_CHANGES_CN.md).
+
 ## Current Status
 
 The public tree is an executable ROS2 porting checkpoint, not a packaged

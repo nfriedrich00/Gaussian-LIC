@@ -4,7 +4,7 @@
 // property frontend_raw (point_step=16, no time) cannot provide. Replicates
 // upstream livox_feature_extraction.cpp ParsePointCloud field reads + filter:
 //   keep iff (line < n_scan) && ((tag & 0x30)==0x10), RTPoint.time = int64(offset_time).
-// This de-risks the corrected ingest target before the full msg_manager port.
+// This is the point-timing contract test for the now-ported MsgManager path.
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>

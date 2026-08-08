@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [PARITY][SAFETY]: upstream simple-knn CUDA math is namespaced
+// and wrapped for the Torch backend.  Reduction extrema and degenerate-axis
+// guards below are correctness fixes for planar/constant-coordinate clouds.
+
 #define BOX_SIZE 1024
 
 #include "simple_knn.hpp"
@@ -50,6 +54,9 @@ __host__ __device__ uint32_t prep_morton(uint32_t value)
 
 __host__ __device__ uint32_t coord_to_morton(float3 coord, float3 min_point, float3 max_point)
 {
+  // ROS2_PORT_NOTE [SAFETY]: upstream divided by the raw span; a flat axis
+  // produced NaN/Inf Morton coordinates.  The epsilon only affects that
+  // degenerate input class.
   const float span_x = fmaxf(max_point.x - min_point.x, 1.0e-9F);
   const float span_y = fmaxf(max_point.y - min_point.y, 1.0e-9F);
   const float span_z = fmaxf(max_point.z - min_point.z, 1.0e-9F);

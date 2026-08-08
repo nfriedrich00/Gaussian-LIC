@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [PARITY]: implementation home for the upstream LIC2 Gaussian
+// model after the monolithic gaussian.cpp/renderer.cpp split.  Code guarded by
+// apply_exposure or enable_non_upstream_density_control is an explicit opt-in
+// extension; standard profiles keep both non-parity paths disabled.
+
 #include <gaussian_lic_mapping/torch_backend.hpp>
 #ifdef GAUSSIAN_LIC_ENABLE_CUDA
 #include <gaussian_lic_mapping/cuda/fused_ssim.hpp>

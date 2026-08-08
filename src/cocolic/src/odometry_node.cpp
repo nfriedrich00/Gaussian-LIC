@@ -31,6 +31,11 @@
 
 #include <odom/odometry_manager.h>
 
+// ROS2_PORT_NOTE [ROS_API][BEHAVIOR]: the ROS1 NodeHandle entry point became a
+// finite rosbag2 replay node with ament config lookup, parameter overrides,
+// writable output, RAII executor shutdown and failure on an empty trajectory.
+// See docs/ROS1_TO_ROS2_CHANGES_CN.md for the complete migration boundary.
+
 using namespace cocolic;
 
 namespace

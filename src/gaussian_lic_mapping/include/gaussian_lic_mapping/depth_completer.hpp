@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [UPSTREAM_LIC2][COMPAT]: SPNet itself was already added by
+// ROS1 LIC2.  Jazzy rewrites only its TensorRT host runtime for TRT 8/10 named
+// I/O, dynamic shapes, an owned CUDA stream/pinned buffers and RAII; acceptance
+// and metric-depth post-processing remain the LIC2 contract.
+
 #pragma once
 
 #include <memory>

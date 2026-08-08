@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// ROS2_PORT_NOTE [PARITY]: this is the non-Torch state split from ROS1
+// Dataset—train/test cameras plus pending/map world points and colors.  It is a
+// structural rewrite, while keyframe naming and accumulation semantics follow
+// LIC2; ROS2 queues and message conversion live outside this class.
+
 #pragma once
 
 #include <cstddef>
