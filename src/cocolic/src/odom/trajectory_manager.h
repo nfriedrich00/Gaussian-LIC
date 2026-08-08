@@ -223,6 +223,17 @@ namespace cocolic
     }
     void ClearRenderPhotometric() { rp_enable_ = false; rp_observed_gray_.release(); rp_patches_.clear(); rp_valid_.clear(); }
 
+    // Render-SE3(论文 Option 2):渲染对齐收敛得到的绝对 IMU 位姿测量;
+    // UpdateTrajectoryWithLIC 在 PnP 因子旁将其作为 IMUPoseFactorNURBS 入图。
+    void SetRenderSe3Pose(const PoseData &pd, double pos_w, double rot_w)
+    {
+      rse3_pose_ = pd;
+      rse3_pos_w_ = pos_w;
+      rse3_rot_w_ = rot_w;
+      rse3_valid_ = true;
+    }
+    void ClearRenderSe3Pose() { rse3_valid_ = false; }
+
     // Diagnostic: time-windowed LiDAR degradation (good -> bad -> good). During [start,end)
     // of the trajectory the LiDAR factor weight is scaled by factor (<1 weakens LIO),
     // so the map built in the good segments must carry the degraded segment (breaks
@@ -327,6 +338,11 @@ namespace cocolic
     int rp_patch_half_ = 2;
     double rp_weight_ = 1.0;
     bool rp_enable_ = false;
+    // Render-SE3(论文 Camera Factor Option 2):渲染对齐收敛位姿(IMU 系)测量。
+    PoseData rse3_pose_;
+    double rse3_pos_w_ = 0.0;
+    double rse3_rot_w_ = 0.0;
+    bool rse3_valid_ = false;
     int init_solve_count_ = 0;
     int loam_solve_count_ = 0;
 

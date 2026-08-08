@@ -173,6 +173,16 @@ namespace cocolic
     enable_render_photometric_ = node["enable_render_photometric"] ? node["enable_render_photometric"].as<bool>() : false;
     if (node["render_photo_weight"]) rp_weight_ = node["render_photo_weight"].as<double>();
     if (node["render_photo_patch_half"]) rp_patch_half_ = node["render_photo_patch_half"].as<int>();
+    // Render-SE3(论文 Option 2):渲染对齐 → 绝对位姿因子。
+    enable_render_se3_pose_ = node["enable_render_se3_pose"] ? node["enable_render_se3_pose"].as<bool>() : false;
+    if (node["render_se3_pos_weight"]) rse3_pos_weight_ = node["render_se3_pos_weight"].as<double>();
+    if (node["render_se3_rot_weight"]) rse3_rot_weight_ = node["render_se3_rot_weight"].as<double>();
+    if (node["render_se3_iterations"]) rse3_iterations_ = node["render_se3_iterations"].as<int>();
+    if (node["render_se3_min_samples"]) rse3_min_samples_ = node["render_se3_min_samples"].as<int>();
+    if (node["render_se3_stride"]) rse3_stride_ = node["render_se3_stride"].as<int>();
+    if (node["render_se3_max_step_m"]) rse3_max_step_m_ = node["render_se3_max_step_m"].as<double>();
+    if (node["render_se3_max_lag_s"]) rse3_max_lag_s_ = node["render_se3_max_lag_s"].as<double>();
+    if (node["render_se3_huber"]) rse3_huber_ = node["render_se3_huber"].as<double>();
     // Diagnostic: time-windowed LiDAR degradation (good -> bad -> good) for an asymmetric
     // scenario where the good-segment map independently corrects the degraded segment.
     if (node["lidar_degrade_window_start_s"] && node["lidar_degrade_window_end_s"])
@@ -425,7 +435,10 @@ namespace cocolic
     /// [5] finely optimize trajectory based on prior、lidar、imu、camera
     // Render-photometric: build render-photometric reference once per frame (used in all iters).
     if (process_image)
+    {
       BuildRenderPhotometric();
+      BuildRenderSe3Pose(msg.image_timestamp);
+    }
     for (int iter = 0; iter < lidar_iter_; ++iter)
     {
       lidar_handler_->GetLoamFeatureAssociation();
@@ -777,7 +790,9 @@ namespace cocolic
   {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::remove_all(out_dir, ec);  // fresh mapper_contract bag each run
+    // ROS2_PORT_NOTE [BEHAVIOR][DESTRUCTIVE]: rosbag2 cannot append here, so a
+    // reused mapper-contract directory is recursively overwritten.
+    fs::remove_all(out_dir, ec);
     forgs_writer_ = std::make_shared<rosbag2_cpp::Writer>();
     rosbag2_storage::StorageOptions so;
     so.uri = out_dir;
@@ -790,8 +805,8 @@ namespace cocolic
     std::cout << "\n[cocolic_ros2] for_gs mapper-contract writer -> " << out_dir << "\n";
   }
 
-  // Mapper-feedback: create live /*_for_gs publishers (best_effort/keep_last to match
-  // the mapper's sensor QoS) so the CUDA mapper can run concurrently with Coco-LIC.
+  // Mapper-feedback: create live /*_for_gs publishers so the CUDA mapper can
+  // run concurrently with Coco-LIC.
   void OdometryManager::OpenForGsLivePublishers()
   {
     if (gs_node_) return;
@@ -838,6 +853,9 @@ namespace cocolic
     bool have = false;
     {
       std::lock_guard<std::mutex> lk(gs_fb_mutex_);
+      // ROS2_PORT_NOTE [NEW][BEHAVIOR]: newest cached render, not the render
+      // nearest the current image stamp; without lockstep this may be stale or
+      // future feedback.
       if (!gs_feedback_.empty()) { fb = gs_feedback_.rbegin()->second; have = true; }
     }
     if (!have || v_points_.empty())
@@ -883,6 +901,178 @@ namespace cocolic
     if (++render_photo_probe_count_ % 25 == 0)
       std::cout << "[Mapper-feedback render-photo] valid_patches=" << n_valid << "/" << v_points_.size() << "\n";
     trajectory_manager_->SetRenderPhotometric(observed_gray, std::move(patches), std::move(valid), half, rp_weight_);
+  }
+
+  // Render-SE3(论文 Camera Factor Option 2 的位姿级实现):
+  //   参考帧 k = 最新 mapper 反馈(渲染图 R_k + 该帧 LiDAR 投影深度 D_k + 渲染位姿 T_k)。
+  //   当前帧 j:以样条位姿为初值,对固定参考做 warp-GN 迭代
+  //     r = I_j(π(T_j⁻¹·(T_k·D_k⁻¹π⁻¹(p)))) − R_k(p)  (亮度偏置 b 在线补偿)
+  //   收敛的 T̃_wc 转 IMU 系交 SetRenderSe3Pose → IMUPoseFactorNURBS 入窗口求解。
+  //   与 ON₄ 教训的区别:参考位姿=渲染位姿(k),当前帧向它 warp,帧间基线小、
+  //   恒处光度线性化域;失败路径一律 Clear+计数,不静默。
+  void OdometryManager::BuildRenderSe3Pose(int64_t img_time_ns)
+  {
+    // 退出路径计数器(诊断"静默不生效"):每 50 次调用打印一次直方图。
+    static int64_t c_call = 0, c_off = 0, c_nofb = 0, c_stale = 0, c_dec = 0,
+                   c_empty = 0, c_res = 0, c_pose = 0, c_starve = 0, c_step = 0, c_ok = 0;
+    if (++c_call % 50 == 0)
+      std::cout << "[Render-SE3 gate] call=" << c_call << " off=" << c_off
+                << " nofb=" << c_nofb << " stale=" << c_stale << " dec=" << c_dec
+                << " empty=" << c_empty << " res=" << c_res << " pose=" << c_pose
+                << " starve=" << c_starve << " step=" << c_step << " ok=" << c_ok << "\n";
+    trajectory_manager_->ClearRenderSe3Pose();
+    if (!gs_live_publish_ || !enable_render_se3_pose_ || !gs_node_)
+    { ++c_off; return; }
+    gaussian_lic_msgs::msg::RenderedFeedback fb;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> lk(gs_fb_mutex_);
+      if (!gs_feedback_.empty()) { fb = gs_feedback_.rbegin()->second; have = true; }
+    }
+    if (!have)
+    { ++c_nofb; return; }
+    // observed_stamp 是绝对 ROS 时间,估计器内部是相对轨迹起点时间 —— 必须换基
+    // (发布侧 WriteForGsFrame 用 time + GetDataStartTime(),此处做逆变换)。
+    const int64_t fb_ns =
+        (int64_t)fb.observed_stamp.sec * 1000000000LL + (int64_t)fb.observed_stamp.nanosec -
+        trajectory_->GetDataStartTime();
+    if (fb_ns > img_time_ns || img_time_ns - fb_ns > (int64_t)(rse3_max_lag_s_ * 1e9))
+    { ++c_stale; return; }  // 参考帧过旧或异常超前
+    cv::Mat rendered_gray, depth_k;
+    try
+    {
+      rendered_gray = cv_bridge::toCvCopy(fb.image, "mono8")->image;
+      depth_k = cv_bridge::toCvCopy(fb.observed_depth_image, "32FC1")->image;
+    }
+    catch (...) { ++c_dec; return; }
+    if (rendered_gray.empty() || depth_k.empty() || camera_handler_->img_pose_->m_img.empty())
+    { ++c_empty; return; }
+    cv::Mat observed_gray;
+    cv::cvtColor(camera_handler_->img_pose_->m_img, observed_gray, cv::COLOR_BGR2GRAY);
+    const int W = observed_gray.cols, H = observed_gray.rows;
+    if (rendered_gray.cols != W || rendered_gray.rows != H ||
+        depth_k.cols != W || depth_k.rows != H)
+    { ++c_res; return; }
+    const auto &sp = fb.source_pose;
+    Eigen::Quaterniond q_k(sp.orientation.w, sp.orientation.x, sp.orientation.y, sp.orientation.z);
+    Eigen::Vector3d t_k(sp.position.x, sp.position.y, sp.position.z);
+    if (q_k.norm() < 1e-6)
+    { ++c_pose; return; }  // mapper 未填 source_pose
+    q_k.normalize();
+    const Eigen::Matrix3d R_k = q_k.toRotationMatrix();
+
+    SE3d T_wc0 = trajectory_->GetCameraPoseNURBS(img_time_ns);
+    Eigen::Matrix3d R_j = T_wc0.so3().matrix();
+    Eigen::Vector3d t_j = T_wc0.translation();
+    const Eigen::Vector3d t_j0 = t_j;
+    const double fx = K_(0, 0), fy = K_(1, 1), cx = K_(0, 2), cy = K_(1, 2);
+    const double inv_fx = 1.0 / fx, inv_fy = 1.0 / fy;
+
+    const auto sample = [&](double u, double v, double &val, double &gu, double &gv) -> bool {
+      const int x0 = (int)std::floor(u), y0 = (int)std::floor(v);
+      if (x0 < 1 || y0 < 1 || x0 + 2 >= W || y0 + 2 >= H)
+        return false;
+      const double ax = u - x0, ay = v - y0;
+      const auto px = [&](int xx, int yy) { return (double)observed_gray.at<uint8_t>(yy, xx); };
+      const auto bil = [&](int xx, int yy) {
+        return (1 - ax) * (1 - ay) * px(xx, yy) + ax * (1 - ay) * px(xx + 1, yy) +
+               (1 - ax) * ay * px(xx, yy + 1) + ax * ay * px(xx + 1, yy + 1);
+      };
+      val = bil(x0, y0);
+      gu = 0.5 * (bil(x0 + 1, y0) - bil(x0 - 1, y0));
+      gv = 0.5 * (bil(x0, y0 + 1) - bil(x0, y0 - 1));
+      return true;
+    };
+
+    int iters = 0, used = 0;
+    double bias = 0.0, final_mean_abs_r = 0.0;
+    bool have_bias = false;
+    for (; iters < rse3_iterations_; ++iters)
+    {
+      Eigen::Matrix<double, 6, 6> Hs = Eigen::Matrix<double, 6, 6>::Zero();
+      Eigen::Matrix<double, 6, 1> bs = Eigen::Matrix<double, 6, 1>::Zero();
+      used = 0;
+      int n_raw = 0;
+      double sum_r_raw = 0.0, sum_abs = 0.0;
+      const Eigen::Matrix3d R_jT = R_j.transpose();
+      for (int v = 2; v < H - 2; v += rse3_stride_)
+        for (int u = 2; u < W - 2; u += rse3_stride_)
+        {
+          const float d = depth_k.at<float>(v, u);
+          if (!(d > 0.3f && d < 80.f))
+            continue;
+          const Eigen::Vector3d Xc_k((u - cx) * inv_fx * d, (v - cy) * inv_fy * d, d);
+          const Eigen::Vector3d Xw = R_k * Xc_k + t_k;
+          const Eigen::Vector3d Xc = R_jT * (Xw - t_j);
+          if (Xc.z() < 0.3)
+            continue;
+          const double uj = fx * Xc.x() / Xc.z() + cx;
+          const double vj = fy * Xc.y() / Xc.z() + cy;
+          double val, gu, gv;
+          if (!sample(uj, vj, val, gu, gv))
+            continue;
+          double r = val - (double)rendered_gray.at<uint8_t>(v, u);
+          sum_r_raw += r;
+          ++n_raw;
+          if (have_bias)
+            r -= bias;
+          const double ar = std::abs(r);
+          double w = 1.0;
+          if (rse3_huber_ > 0.0 && ar > rse3_huber_)
+            w = rse3_huber_ / ar;
+          if (std::hypot(gu, gv) < 1.0)
+            continue;
+          const double z = Xc.z(), iz = 1.0 / z, iz2 = iz * iz;
+          Eigen::Matrix<double, 2, 3> Jpix;
+          Jpix << fx * iz, 0, -fx * Xc.x() * iz2,
+                  0, fy * iz, -fy * Xc.y() * iz2;
+          Eigen::Matrix<double, 3, 6> Jse3;
+          Jse3.block<3, 3>(0, 0) = SO3d::hat(Xc);
+          Jse3.block<3, 3>(0, 3) = -Eigen::Matrix3d::Identity();
+          const Eigen::Matrix<double, 1, 6> J =
+              (Eigen::Matrix<double, 1, 2>() << gu, gv).finished() * Jpix * Jse3;
+          Hs.noalias() += w * J.transpose() * J;
+          bs.noalias() += w * J.transpose() * r;
+          sum_abs += ar;
+          ++used;
+        }
+      if (n_raw > 50)
+      {
+        bias = sum_r_raw / n_raw;
+        have_bias = true;
+      }
+      if (used < rse3_min_samples_)
+      { ++c_starve; return; }  // 采样饥饿(遮挡/无深度),弃用该帧测量
+      final_mean_abs_r = sum_abs / used;
+      const Eigen::Matrix<double, 6, 1> delta = Hs.ldlt().solve(-bs);
+      if (!delta.allFinite())
+        break;
+      const Eigen::Vector3d dphi = delta.head<3>(), drho = delta.tail<3>();
+      t_j = t_j + R_j * drho;                    // 右扰动:t += R·δρ(旧 R)
+      R_j = R_j * SO3d::exp(dphi).matrix();      //         R ·= Exp(δφ)
+      if (drho.norm() < 1e-4 && dphi.norm() < 1e-4)
+      {
+        ++iters;
+        break;
+      }
+    }
+    if ((t_j - t_j0).norm() > rse3_max_step_m_)
+    { ++c_step; return; }  // 修正超限幅:失配超线性化域,弃用
+
+    // 相机位姿 → IMU 位姿:T_wi = T_wc · T_ic⁻¹
+    const auto &ep = trajectory_->GetSensorEP(CameraSensor);
+    const Eigen::Matrix3d R_ic = ep.so3.matrix();
+    const Eigen::Matrix3d R_wi = R_j * R_ic.transpose();
+    PoseData pd;
+    pd.timestamp = img_time_ns;
+    pd.position = t_j - R_wi * ep.p;
+    pd.orientation = SO3d(Eigen::Quaterniond(R_wi).normalized());
+    ++c_ok;
+    trajectory_manager_->SetRenderSe3Pose(pd, rse3_pos_weight_, rse3_rot_weight_);
+    if (++rse3_probe_count_ % 25 == 0)
+      std::cout << "[Render-SE3] iters=" << iters << " samples=" << used
+                << " mean|r|=" << final_mean_abs_r << " corr=" << (t_j - t_j0).norm()
+                << "m bias=" << bias << " lag=" << (img_time_ns - fb_ns) * 1e-9 << "s\n";
   }
 
   // Mapper lockstep pacing (OQ4 fix): block after a published frame until the mapper's

@@ -18,9 +18,9 @@
 
 #pragma once
 
-// ROS2 Jazzy port: dropped <ros/ros.h>. Camera front-end = slimmed R3LIVE
-// (camera/r3live_slim.hpp) — the visual-front-end subset (optical-flow tracking
-// + RGB map) feeding the ported image_feature_factor; full LICO for sub-cm.
+// ROS2_PORT_NOTE [ROS_API][BEHAVIOR]: dropped <ros/ros.h>. Camera front-end is
+// slimmed R3LIVE feeding the ported image factor. It is functional LICO, but
+// historical centimetre results are not a current-HEAD accuracy guarantee.
 #include <odom/msg_manager.h>
 #include <odom/odometry_viewer.h>
 #include <odom/trajectory_manager.h>
@@ -278,6 +278,21 @@ namespace cocolic
     double rp_weight_ = 0.5;
     int rp_patch_half_ = 2;
     void BuildRenderPhotometric();
+
+    // Render-SE3(论文 Camera Factor Option 2):当前观测帧对"mapper 渲染参考帧"
+    // (feedback 自带渲染图 + observed_depth + source_pose)做定参考 warp-GN 迭代
+    // 对齐,收敛相机位姿转 IMU 系后经 SetRenderSe3Pose 交给 LIC 窗口求解。
+    bool enable_render_se3_pose_ = false;
+    double rse3_pos_weight_ = 20.0;   // sqrt-info 对角(1/σ),位置
+    double rse3_rot_weight_ = 20.0;   // sqrt-info 对角(1/σ),姿态
+    int rse3_iterations_ = 6;
+    int rse3_min_samples_ = 150;
+    int rse3_stride_ = 4;
+    double rse3_max_step_m_ = 0.5;    // 对齐总修正限幅(超限弃用该帧测量)
+    double rse3_max_lag_s_ = 0.7;     // 参考帧最大陈旧度
+    double rse3_huber_ = 12.0;        // 灰度残差 Huber(0-255 域)
+    int64_t rse3_probe_count_ = 0;
+    void BuildRenderSe3Pose(int64_t img_time_ns);
 
     std::queue<int64_t> time_buf;  // img timestamp
     std::queue<LiDARFeature> lidar_buf;  // lidarfeature in local

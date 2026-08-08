@@ -462,6 +462,13 @@ namespace cocolic
               K_, rp_weight_);
         }
       }
+
+      // Render-SE3(论文 Camera Factor Option 2):渲染对齐收敛位姿作为绝对
+      // IMU 位姿测量入连续时间因子图(IMUPoseFactorNURBS,对角 sqrt-info)。
+      if (rse3_valid_)
+      {
+        estimator->AddPoseMeasurementAnalyticDiffNURBS(rse3_pose_, rse3_pos_w_, rse3_rot_w_);
+      }
     }
     else
     {

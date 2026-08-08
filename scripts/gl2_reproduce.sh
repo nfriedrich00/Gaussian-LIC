@@ -186,7 +186,8 @@ start_mapper() {
   require_path "${MAPBIN}"
   "${MAPBIN}" --ros-args \
     --params-file "${WS}/run_lio/config/cbd_mapper_coupled.yaml" \
-    -p save_map_render_evaluation:="${save_render_eval}" >"${log}" 2>&1 &
+    -p save_map_render_evaluation:="${save_render_eval}" \
+    -p depth_completion:="${GL2_DEPTH_COMPLETION:-true}" >"${log}" 2>&1 &
   MAP_PID=$!
 
   for second in $(seq 1 90); do
@@ -225,6 +226,23 @@ case "${MODE}" in
   degraded-coupled)
     start_mapper false
     run_track_a "${WS}/run_lio/config/ct_odometry_lico_degraded_coupled.yaml" degraded_coupled
+    ate "${TRACK_A_TRAJECTORY}" "${RUN_ROOT}/ate.json"
+    cleanup_mapper
+    ;;
+  asym-baseline)
+    run_track_a "${WS}/run_lio/config/ct_odometry_lico_asym_baseline.yaml" asym_baseline
+    ate "${TRACK_A_TRAJECTORY}" "${RUN_ROOT}/ate.json"
+    ;;
+  asym-se3pose)
+    start_mapper false
+    run_track_a "${WS}/run_lio/config/ct_odometry_lico_asym_se3pose.yaml" asym_se3pose
+    ate "${TRACK_A_TRAJECTORY}" "${RUN_ROOT}/ate.json"
+    cleanup_mapper
+    ;;
+  degraded-se3pose)
+    # Render-SE3(论文 Camera Factor Option 2 位姿级):光度耦合关,SE3 位姿因子开。
+    start_mapper false
+    run_track_a "${WS}/run_lio/config/ct_odometry_lico_degraded_se3pose.yaml" degraded_se3pose
     ate "${TRACK_A_TRAJECTORY}" "${RUN_ROOT}/ate.json"
     cleanup_mapper
     ;;

@@ -360,6 +360,20 @@ if(GAUSSIAN_LIC_ENABLE_TORCH)
       Eigen3::Eigen
       CUDA::cudart
     )
+
+    add_executable(gaussian_map_render_server
+      src/mapper_dataset.cpp
+      src/gaussian_map_render_server.cpp
+    )
+    target_include_directories(gaussian_map_render_server PRIVATE include ${OpenCV_INCLUDE_DIRS})
+    target_compile_options(gaussian_map_render_server PRIVATE ${TORCH_CXX_FLAGS})
+    target_link_libraries(gaussian_map_render_server
+      torch_backend
+      ${TORCH_LIBRARIES}
+      ${OpenCV_LIBS}
+      Eigen3::Eigen
+      CUDA::cudart
+    )
   endif()
 
   target_compile_definitions(mapping_node PRIVATE GAUSSIAN_LIC_ENABLE_TORCH=1)

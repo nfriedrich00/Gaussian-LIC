@@ -328,13 +328,39 @@ void interp_pose(
 int main(int argc, char ** argv)
 {
   if (argc < 5) {
-    std::cerr << "usage: gaussian_map_renderer <ply> <ct_tum> <stamps_json> <out_dir>\n";
+    std::cerr << "usage: gaussian_map_renderer <ply> <ct_tum> <stamps_json> <out_dir>"
+                 " [fx fy cx cy qx qy qz qw tx ty tz]\n"
+                 "  optional 11 args override the built-in CBD/fastlivo2 intrinsics"
+                 " and cam->IMU extrinsic (e.g. for fastlivo v1 sequences)\n";
     return 2;
   }
   const std::string ply_path = argv[1];
   const std::string tum_path = argv[2];
   const std::string stamps_path = argv[3];
   const std::string out_dir = argv[4];
+  double fx = kFx, fy = kFy, cx = kCx, cy = kCy;
+  double eqx = kCamImuQx, eqy = kCamImuQy, eqz = kCamImuQz, eqw = kCamImuQw;
+  double etx = kCamImuTx, ety = kCamImuTy, etz = kCamImuTz;
+  if (argc >= 16) {
+    fx = std::atof(argv[5]);
+    fy = std::atof(argv[6]);
+    cx = std::atof(argv[7]);
+    cy = std::atof(argv[8]);
+    eqx = std::atof(argv[9]);
+    eqy = std::atof(argv[10]);
+    eqz = std::atof(argv[11]);
+    eqw = std::atof(argv[12]);
+    etx = std::atof(argv[13]);
+    ety = std::atof(argv[14]);
+    etz = std::atof(argv[15]);
+    std::cout << "[renderer] override intrinsics fx=" << fx << " fy=" << fy
+              << " cx=" << cx << " cy=" << cy << " extrinsic q=[" << eqx << ","
+              << eqy << "," << eqz << "," << eqw << "] t=[" << etx << "," << ety
+              << "," << etz << "]" << std::endl;
+  } else if (argc != 5) {
+    std::cerr << "expected 4 or 15 args, got " << (argc - 1) << "\n";
+    return 2;
+  }
 
   if (!torch::cuda::is_available()) {
     std::cerr << "CUDA is not available\n";
@@ -377,8 +403,8 @@ int main(int argc, char ** argv)
   std::cout << "[renderer] observed stamps=" << stamps.size() << std::endl;
 
   const Eigen::Quaterniond q_cam_to_imu =
-    Eigen::Quaterniond(kCamImuQw, kCamImuQx, kCamImuQy, kCamImuQz).normalized();
-  const Eigen::Vector3d p_cam_to_imu(kCamImuTx, kCamImuTy, kCamImuTz);
+    Eigen::Quaterniond(eqw, eqx, eqy, eqz).normalized();
+  const Eigen::Vector3d p_cam_to_imu(etx, ety, etz);
 
   gaussian_lic_mapping::GaussianBackendConfig config;
   config.white_background = false;
@@ -422,7 +448,7 @@ int main(int argc, char ** argv)
     frame.t_wc = t_body + q_body.normalized() * p_cam_to_imu;
 
     const auto camera = gaussian_lic_mapping::make_torch_camera(
-      frame, kFx, kFy, kCx, kCy, device, device);
+      frame, fx, fy, cx, cy, device, device);
     const auto result =
       gaussian_lic_mapping::render_gaussian_map_from_camera(map, camera, config, device);
 

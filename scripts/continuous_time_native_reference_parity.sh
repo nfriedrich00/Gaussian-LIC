@@ -458,6 +458,12 @@ setsid ros2 run gaussian_lic_tracking continuous_time_node \
   -p map_photometric_voxel_m:="${MAP_PHOTOMETRIC_VOXEL_M:-0.2}" \
   -p map_photometric_min_obs:="${MAP_PHOTOMETRIC_MIN_OBS:-3}" \
   -p enable_render_photometric:="${ENABLE_RENDER_PHOTOMETRIC:-false}" \
+  -p enable_render_se3_prior:="${ENABLE_RENDER_SE3_PRIOR:-false}" \
+  -p enable_render_se3_prior_inloop:="${ENABLE_RENDER_SE3_PRIOR_INLOOP:-false}" \
+  -p visual_se3_inloop_iterations:="${VISUAL_SE3_INLOOP_ITERATIONS:-6}" \
+  -p visual_se3_inloop_se3_factor:="${VISUAL_SE3_INLOOP_SE3_FACTOR:-false}" \
+  -p render_server_socket_path:="$([ -n "${RENDER_SERVER_SOCKET_PATH:-}" ] && echo "${RENDER_SERVER_SOCKET_PATH}" || echo "''")" \
+  -p render_gauge_tum_path:="$([ -n "${RENDER_GAUGE_TUM_PATH:-}" ] && echo "${RENDER_GAUGE_TUM_PATH}" || echo "''")" \
   -p deterministic_feedback_bag_path:="$([ -n "${DETERMINISTIC_FEEDBACK_BAG_PATH:-}" ] && echo "${DETERMINISTIC_FEEDBACK_BAG_PATH}" || echo "''")" \
   -p rendered_feedback_topic:="${RENDERED_FEEDBACK_TOPIC:-/gaussian_lic/rendered_feedback}" \
   -p visual_se3_position_weight:="${VISUAL_SE3_POSITION_WEIGHT}" \
