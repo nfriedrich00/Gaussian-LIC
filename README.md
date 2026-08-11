@@ -157,12 +157,14 @@ A/B harnesses:
 ./scripts/degen_ab.sh se3pose
 ```
 
-Measured boundary across these testbeds: the factor stays active on 95%+ of
-frames yet is redundant whenever the front-end keeps any competing visual
-anchor; with the native PnP factors disabled on the truly degenerate sequence
-it substantially recovers trajectory shape (loop-closure drift 26.1% to
-22.1%, y-span restored to the reference scale), while global rescue remains
-limited because the online map drifts with the odometry that builds it.
+Measured boundary across these testbeds (repeated runs, not single trials):
+the factor stays active on 95%+ of frames yet produces no measurable accuracy
+benefit in any tested configuration — healthy, weakened-LiDAR, transient
+degradation, or true geometric degeneracy with or without competing visual
+anchors. On the unanchored degenerate testbed both arms scatter wildly across
+repeats (loop-closure drift 9-26% baseline, 10-50% with the factor), so
+single-run differences there are noise; an earlier commit message describing
+a shape-recovery effect predates this repetition study and is superseded.
 
 ## Evidence Snapshot
 
@@ -235,10 +237,11 @@ surface for this port.
 - Dataset-level claims depend on valid references; broken zero-trajectory
   upstream references are treated as evidence defects, not silently accepted.
 - Closed-loop render feedback (patch-photometric and the pose-level Camera
-  Factor Option 2) measures as redundant while the front-end retains any
-  competing visual anchor; it recovers trajectory shape only under true LiDAR
-  degeneracy with the native visual factors disabled, and global rescue stays
-  bounded by the map drifting with the odometry that builds it.
+  Factor Option 2) measures as producing no repeatable accuracy benefit in
+  any tested configuration; the unanchored degenerate testbed is chaotic
+  across repeats, so single-run effects there must not be read as signal.
+  The mechanism stays active and numerically healthy — the finding is a
+  boundary statement about its utility in this pipeline, not a defect.
 
 ## Detailed Notes
 
